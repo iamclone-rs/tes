@@ -66,6 +66,13 @@ def make_jigsaw(img, grid=3, perm=None):
     jig_img = rebuild_from_perm(img, perm=perm, grid=grid)
     return jig_img, perm
 
+def extract_instance_id(file_path_or_name):
+    file_name = os.path.basename(file_path_or_name)
+    stem, _ = os.path.splitext(file_name)
+    if "-" in stem:
+        return stem.rsplit("-", 1)[0]
+    return stem
+
 def generate_permutation_bank(grid=3, num_perms=30, seed=42):
     rng = random.Random(seed)
     total_tiles = grid ** 2
@@ -180,7 +187,7 @@ class SketchyDataset(torch.utils.data.Dataset):
         sk_path = self.all_sketches_path[index]
         category = sk_path.split(os.path.sep)[-2]
 
-        pos_sample = sk_path.split('/')[-1].split('-')[:-1][0]
+        pos_sample = extract_instance_id(sk_path)
         pos_path = glob.glob(os.path.join(self.args.root, 'photo', category, pos_sample + '.*'))
         if len(pos_path) == 0:
             print(sk_path)

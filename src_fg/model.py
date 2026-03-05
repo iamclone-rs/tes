@@ -1,5 +1,6 @@
 import copy
 import numpy as np
+import os
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
@@ -21,6 +22,13 @@ def freeze_all_but_bn(m):
             m.weight.requires_grad_(False)
         if hasattr(m, 'bias') and m.bias is not None:
             m.bias.requires_grad_(False)
+
+def extract_instance_id(file_path_or_name):
+    file_name = os.path.basename(file_path_or_name)
+    stem, _ = os.path.splitext(file_name)
+    if "-" in stem:
+        return stem.rsplit("-", 1)[0]
+    return stem
 
 class ConditionalJigsawSolver(nn.Module):
     def __init__(self, embed_dim=512, num_perms=30):
@@ -227,19 +235,25 @@ class ZS_SBIR(pl.LightningModule):
                     
     def on_validation_epoch_end(self):
         top1_total, top5_total, total_sk = 0, 0, 0
+        skipped_queries = 0
+        gallery_sizes = []
         
         for category, bucket in self.val.items():
-            rank = torch.zeros(len(bucket["val_sk_names"]))
-            val_img_feature = torch.stack(bucket["val_img_features"])
-            
             if len(bucket["val_img_features"]) == 0:
-                print("rank: ", rank)
-                print(category)
                 continue
+
+            val_img_feature = torch.stack(bucket["val_img_features"])
+            gallery_sizes.append(len(bucket["val_img_names"]))
+            evaluated_ranks = []
+
             for num, sketch_feature in enumerate(bucket["val_sk_features"]):
                 s_name = bucket["val_sk_names"][num]
-                sk_query_name = s_name.split('/')[-1].split('-')[:-1][0]
-                
+                sk_query_name = extract_instance_id(s_name)
+
+                if sk_query_name not in bucket["val_img_names"]:
+                    skipped_queries += 1
+                    continue
+
                 position_query = bucket["val_img_names"].index(sk_query_name)
                 
                 distance = F.pairwise_distance(sketch_feature.unsqueeze(0), val_img_feature)
@@ -248,14 +262,28 @@ class ZS_SBIR(pl.LightningModule):
                     val_img_feature[position_query].unsqueeze(0)
                 )
                 
-                rank[num] = distance.le(target_distance).sum()
+                evaluated_ranks.append(distance.le(target_distance).sum().item())
+
+            if len(evaluated_ranks) == 0:
+                continue
+
+            rank = torch.tensor(evaluated_ranks)
+            top1_total = top1_total + rank.le(1).sum().item()
+            top5_total = top5_total + rank.le(5).sum().item()
+            total_sk = total_sk + len(evaluated_ranks)
                 
-            top1_total = top1_total + rank.le(1).sum().numpy()
-            top5_total = top5_total + rank.le(5).sum().numpy()
-            total_sk = total_sk + rank.shape[0]
-                
-        top1 = top1_total / total_sk
-        top5 = top5_total / total_sk
+        if total_sk == 0:
+            top1, top5 = 0.0, 0.0
+        else:
+            top1 = top1_total / total_sk
+            top5 = top5_total / total_sk
+
+        if len(gallery_sizes) > 0:
+            print(
+                f"Val gallery size/category -> min: {min(gallery_sizes)}, max: {max(gallery_sizes)}, mean: {sum(gallery_sizes)/len(gallery_sizes):.2f}"
+            )
+        if skipped_queries > 0:
+            print(f"Skipped queries (no matching positive name in gallery): {skipped_queries}")
         
         self.log("top1", top1, on_step=False, on_epoch=True)
         print('top1: {}, top5: {}'.format(top1, top5))
