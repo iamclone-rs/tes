@@ -12,7 +12,69 @@ from src_fg.dataset import SketchyDataset
 from src_fg.model import ZS_SBIR
 from src.utils import get_all_categories
 
-    
+class PKBatchSampler(torch.utils.data.Sampler):
+    def __init__(
+        self,
+        dataset,
+        *,
+        batch_size: int,
+        samples_per_class: int,
+        seed: int = 42,
+        drop_last: bool = True,
+    ):
+        if samples_per_class <= 0:
+            raise ValueError("samples_per_class must be > 0")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+        if batch_size % samples_per_class != 0:
+            raise ValueError("batch_size must be divisible by samples_per_class")
+
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.samples_per_class = samples_per_class
+        self.classes_per_batch = batch_size // samples_per_class
+        self.seed = seed
+        self.drop_last = drop_last
+
+        cat_to_label = {c: i for i, c in enumerate(self.dataset.all_categories)}
+        label_to_indices = {}
+        for idx, sk_path in enumerate(self.dataset.all_sketches_path):
+            category = sk_path.split(os.path.sep)[-2]
+            lab = cat_to_label.get(category, None)
+            if lab is None:
+                continue
+            label_to_indices.setdefault(lab, []).append(idx)
+
+        self.label_to_indices = {k: v for k, v in label_to_indices.items() if len(v) > 0}
+        self.labels = list(self.label_to_indices.keys())
+        if len(self.labels) == 0:
+            raise ValueError("No labels found for PK sampling")
+
+        self._epoch = 0
+
+    def __len__(self):
+        if self.drop_last:
+            return len(self.dataset) // self.batch_size
+        return (len(self.dataset) + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        rng = np.random.RandomState(self.seed + self._epoch)
+        self._epoch += 1
+        for _ in range(len(self)):
+            chosen_labels = rng.choice(
+                self.labels,
+                size=self.classes_per_batch,
+                replace=len(self.labels) < self.classes_per_batch,
+            )
+            batch = []
+            for lab in chosen_labels:
+                pool = self.label_to_indices[lab]
+                replace = len(pool) < self.samples_per_class
+                picked = rng.choice(pool, size=self.samples_per_class, replace=replace)
+                batch.extend(int(i) for i in picked.tolist())
+            yield batch
+
+     
 def collate_fn(batch):
     batch = [b for b in batch if b is not None]
     return torch.utils.data.default_collate(batch)
@@ -27,7 +89,19 @@ def get_datasets(opts):
     train_dataset = SketchyDataset(opts, mode="train")
     val_dataset = SketchyDataset(opts, mode="test")
     
-    train_loader = DataLoader(dataset=train_dataset, batch_size=opts.batch_size, num_workers=opts.workers, shuffle=True, collate_fn=collate_fn)
+    use_pk = bool(getattr(opts, "pk_sampling", True))
+    if use_pk:
+        samples_per_class = int(getattr(opts, "samples_per_class", 2))
+        sampler_seed = int(getattr(opts, "sampler_seed", seed))
+        batch_sampler = PKBatchSampler(
+            train_dataset,
+            batch_size=opts.batch_size,
+            samples_per_class=samples_per_class,
+            seed=sampler_seed,
+        )
+        train_loader = DataLoader(dataset=train_dataset, batch_sampler=batch_sampler, num_workers=opts.workers, collate_fn=collate_fn)
+    else:
+        train_loader = DataLoader(dataset=train_dataset, batch_size=opts.batch_size, num_workers=opts.workers, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(dataset=val_dataset, batch_size=opts.test_batch_size, num_workers=opts.workers, shuffle=False, collate_fn=collate_fn)
     
     return train_loader, val_loader
@@ -68,6 +142,9 @@ if __name__ == "__main__":
     parser.add_argument('--workers', type=int, default=2)
     parser.add_argument('--progress', type=bool, default=False)
     parser.add_argument('--use_subset', type=bool, default=False)
+    parser.add_argument('--pk_sampling', type=bool, default=True, help='use PK sampler for hard triplet mining')
+    parser.add_argument('--samples_per_class', type=int, default=2, help='K for PK sampling (batch has P classes, K samples each)')
+    parser.add_argument('--sampler_seed', type=int, default=42, help='seed for PK sampler')
     
     parser.add_argument('--exp_name', type=str, default='Co_prompt')
     

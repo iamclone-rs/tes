@@ -1,3 +1,4 @@
+import os
 import copy
 import numpy as np
 import torch
@@ -101,7 +102,7 @@ class CustomCLIP(nn.Module):
             dropout=jigsaw_dropout,
         )
     
-    def get_logits(self, img_tensor, classnames, type='photo'):
+    def get_logits(self, img_tensor, classnames, type='photo', return_text_features: bool = False):
         if type=='photo':
             prompt_learner = self.prompt_learner_photo
         else:
@@ -139,13 +140,18 @@ class CustomCLIP(nn.Module):
 
         logits = logit_scale * image_features_normalize @ text_features.t()
         
+        if return_text_features:
+            return logits, image_features_normalize, image_features, text_features
+
         return logits, image_features_normalize, image_features
         
     def forward(self, x, classnames):
         photo_tensor, sk_tensor, photo_aug_tensor, sk_aug_tensor, neg_tensor, \
-            sk_perm_tensor, perm_idx, label = x
+            sk_perm_tensor, perm_idx, label, pos_id = x
             
-        pos_logits, photo_features_norm, photo_feature = self.get_logits(photo_tensor, classnames)
+        pos_logits, photo_features_norm, photo_feature, text_features = self.get_logits(
+            photo_tensor, classnames, return_text_features=True
+        )
         sk_logits, sk_feature_norm, sk_feature = self.get_logits(sk_tensor, classnames, type='sketch')
         _, neg_feature_norm, _ = self.get_logits(neg_tensor, classnames)
         
@@ -167,7 +173,7 @@ class CustomCLIP(nn.Module):
         sk_aug_features = self.model_distill.encode_image(sk_aug_tensor)
         
         return photo_features_norm, sk_feature_norm, neg_feature_norm, photo_aug_features, sk_aug_features, \
-            label, pos_logits, sk_logits, photo_feature, sk_feature, jig_logits_r, jig_logits_pos, jig_logits_neg, perm_idx
+            label, pos_logits, sk_logits, photo_feature, sk_feature, jig_logits_r, jig_logits_pos, jig_logits_neg, perm_idx, text_features, pos_id
             
     def extract_feature(self, image, classname, type='photo'):
         _, feature, _ = self.get_logits(image, classnames=classname, type=type)
@@ -279,7 +285,9 @@ class ZS_SBIR(pl.LightningModule):
                 continue
             for num, sketch_feature in enumerate(bucket["val_sk_features"]):
                 s_name = bucket["val_sk_names"][num]
-                sk_query_name = s_name.split('/')[-1].split('-')[:-1][0]
+                sk_base = os.path.basename(s_name)
+                sk_parts = sk_base.split("-")
+                sk_query_name = "-".join(sk_parts[:-1]) if len(sk_parts) > 1 else os.path.splitext(sk_base)[0]
                 
                 position_query = bucket["val_img_names"].index(sk_query_name)
                 

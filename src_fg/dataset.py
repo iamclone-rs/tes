@@ -1,5 +1,4 @@
 import os
-import os
 import glob
 import numpy as np
 import torch
@@ -234,6 +233,7 @@ class SketchyDataset(torch.utils.data.Dataset):
 
         self.all_sketches_path = []
         self.all_photos_path = {}
+        self.photo_id_map = {}
 
         # Conditional cross-modal jigsaw settings (SpLIP-style)
         self.jigsaw_grid = int(getattr(self.args, "jigsaw_grid", 3))
@@ -250,7 +250,12 @@ class SketchyDataset(torch.utils.data.Dataset):
 
         for category in self.all_categories:
             self.all_sketches_path.extend(glob.glob(os.path.join(self.args.root, 'sketch', category, '*')))
-            self.all_photos_path[category] = glob.glob(os.path.join(self.args.root, 'photo', category, '*'))
+            photo_paths = glob.glob(os.path.join(self.args.root, 'photo', category, '*'))
+            self.all_photos_path[category] = photo_paths
+            for p in photo_paths:
+                key = os.path.normcase(os.path.normpath(p))
+                if key not in self.photo_id_map:
+                    self.photo_id_map[key] = len(self.photo_id_map)
 
     def __len__(self):
         return len(self.all_sketches_path)
@@ -259,13 +264,17 @@ class SketchyDataset(torch.utils.data.Dataset):
         sk_path = self.all_sketches_path[index]
         category = sk_path.split(os.path.sep)[-2]
 
-        pos_sample = sk_path.split('/')[-1].split('-')[:-1][0]
+        sk_base = os.path.basename(sk_path)
+        sk_parts = sk_base.split("-")
+        pos_sample = "-".join(sk_parts[:-1]) if len(sk_parts) > 1 else os.path.splitext(sk_base)[0]
         pos_path = glob.glob(os.path.join(self.args.root, 'photo', category, pos_sample + '.*'))
         if len(pos_path) == 0:
             print(sk_path)
             return None
 
         pos_path = pos_path[0]
+        pos_key = os.path.normcase(os.path.normpath(pos_path))
+        pos_id = self.photo_id_map.get(pos_key, -1)
         photo_category = self.all_photos_path[category].copy()
         photo_category = [p for p in photo_category if p != pos_path]
 
@@ -289,7 +298,7 @@ class SketchyDataset(torch.utils.data.Dataset):
             sk_perm_tensor = permute_patches_tensor(sk_tensor, grid=self.jigsaw_grid, perm=perm)
             
             return img_tensor, sk_tensor, img_aug_tensor, sk_aug_tensor, neg_tensor, \
-                sk_perm_tensor, perm_idx, self.all_categories.index(category)
+                sk_perm_tensor, perm_idx, self.all_categories.index(category), pos_id
 
         else:
             return sk_tensor, sk_path, img_tensor, pos_sample, self.all_categories.index(category)
