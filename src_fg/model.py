@@ -1,6 +1,5 @@
 import copy
 import numpy as np
-import os
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
@@ -23,32 +22,49 @@ def freeze_all_but_bn(m):
         if hasattr(m, 'bias') and m.bias is not None:
             m.bias.requires_grad_(False)
 
-def extract_instance_id(file_path_or_name):
-    file_name = os.path.basename(file_path_or_name)
-    stem, _ = os.path.splitext(file_name)
-    if "-" in stem:
-        return stem.rsplit("-", 1)[0]
-    return stem
-
-class ConditionalJigsawSolver(nn.Module):
-    def __init__(self, embed_dim=512, num_perms=30):
+class JigsawSolver(nn.Module):
+    def __init__(
+        self,
+        *,
+        embed_dim: int,
+        num_classes: int,
+        num_layers: int = 2,
+        nhead: int = 8,
+        dropout: float = 0.1,
+    ):
         super().__init__()
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=8,
-            dim_feedforward=embed_dim * 4,
-            dropout=0.1,
-            batch_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=2)
-        self.classifier = nn.Linear(embed_dim * 2, num_perms)
+        if embed_dim % nhead != 0:
+            raise ValueError("embed_dim must be divisible by nhead")
 
-    def forward(self, cond_feat, jig_feat):
-        tokens = torch.stack([cond_feat.float(), jig_feat.float()], dim=1)
-        encoded = self.encoder(tokens)
-        fused = encoded.reshape(encoded.size(0), -1)
-        logits = self.classifier(fused)
-        return logits
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=nhead,
+            dim_feedforward=embed_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.pos_embed = nn.Parameter(torch.zeros(1, 2, embed_dim))
+        self.classifier = nn.Linear(embed_dim, num_classes)
+
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.classifier.weight, std=0.02)
+        nn.init.zeros_(self.classifier.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, 2, D] fused token sequence
+        returns logits: [B, num_classes]
+        """
+        if x.dim() != 3 or x.size(1) != 2:
+            raise ValueError("Expected x with shape [B, 2, D]")
+
+        x = x + self.pos_embed.to(dtype=x.dtype, device=x.device)
+        h = self.encoder(x)
+        pooled = h.mean(dim=1)
+        return self.classifier(pooled)
             
 class CustomCLIP(nn.Module):
     def __init__(
@@ -71,9 +87,18 @@ class CustomCLIP(nn.Module):
         self.model_distill = clip_model_distill
         self.image_adapter_m = 0.1
         self.text_adapter_m = 0.1
-        self.cjs_solver = ConditionalJigsawSolver(
+
+        # Conditional cross-modal jigsaw solver (SpLIP-style)
+        jigsaw_num_perm = int(getattr(args, "jigsaw_num_perm", 100))
+        jigsaw_layers = int(getattr(args, "jigsaw_layers", 2))
+        jigsaw_nhead = int(getattr(args, "jigsaw_nhead", 8))
+        jigsaw_dropout = float(getattr(args, "jigsaw_dropout", 0.1))
+        self.jigsaw_solver = JigsawSolver(
             embed_dim=512,
-            num_perms=getattr(args, "cjs_num_perms", 30)
+            num_classes=jigsaw_num_perm,
+            num_layers=jigsaw_layers,
+            nhead=jigsaw_nhead,
+            dropout=jigsaw_dropout,
         )
     
     def get_logits(self, img_tensor, classnames, type='photo'):
@@ -118,23 +143,31 @@ class CustomCLIP(nn.Module):
         
     def forward(self, x, classnames):
         photo_tensor, sk_tensor, photo_aug_tensor, sk_aug_tensor, neg_tensor, \
-            sk_jig_tensor, perm_idx, label = x
+            sk_perm_tensor, perm_idx, label = x
             
         pos_logits, photo_features_norm, photo_feature = self.get_logits(photo_tensor, classnames)
         sk_logits, sk_feature_norm, sk_feature = self.get_logits(sk_tensor, classnames, type='sketch')
         _, neg_feature_norm, _ = self.get_logits(neg_tensor, classnames)
         
-        _, sk_jig_feature, _ = self.get_logits(sk_jig_tensor, classnames, type='sketch')
+        _, sk_perm_feature_norm, _ = self.get_logits(sk_perm_tensor, classnames, type='sketch')
 
-        cjs_logits_r = self.cjs_solver(sk_feature_norm, sk_jig_feature)
-        cjs_logits_pos = self.cjs_solver(photo_features_norm, sk_jig_feature)
-        cjs_logits_neg = self.cjs_solver(neg_feature_norm, sk_jig_feature)
+        # Jigsaw solver logits for (r, r+, r-) where:
+        # r  = [Fv(sa),   Fv(s'_a)]
+        # r+ = [Fv(p_a+), Fv(s'_a)]
+        # r- = [Fv(p_a-), Fv(s'_a)]
+        r = torch.stack([sk_feature_norm, sk_perm_feature_norm], dim=1)
+        r_pos = torch.stack([photo_features_norm, sk_perm_feature_norm], dim=1)
+        r_neg = torch.stack([neg_feature_norm, sk_perm_feature_norm], dim=1)
+
+        all_r = torch.cat([r, r_pos, r_neg], dim=0).float()
+        all_logits = self.jigsaw_solver(all_r)
+        jig_logits_r, jig_logits_pos, jig_logits_neg = all_logits.chunk(3, dim=0)
         
         photo_aug_features = self.model_distill.encode_image(photo_aug_tensor)
         sk_aug_features = self.model_distill.encode_image(sk_aug_tensor)
         
         return photo_features_norm, sk_feature_norm, neg_feature_norm, photo_aug_features, sk_aug_features, \
-            label, pos_logits, sk_logits, photo_feature, sk_feature, cjs_logits_r, cjs_logits_pos, cjs_logits_neg, perm_idx
+            label, pos_logits, sk_logits, photo_feature, sk_feature, jig_logits_r, jig_logits_pos, jig_logits_neg, perm_idx
             
     def extract_feature(self, image, classname, type='photo'):
         _, feature, _ = self.get_logits(image, classnames=classname, type=type)
@@ -235,25 +268,19 @@ class ZS_SBIR(pl.LightningModule):
                     
     def on_validation_epoch_end(self):
         top1_total, top5_total, total_sk = 0, 0, 0
-        skipped_queries = 0
-        gallery_sizes = []
         
         for category, bucket in self.val.items():
-            if len(bucket["val_img_features"]) == 0:
-                continue
-
+            rank = torch.zeros(len(bucket["val_sk_names"]))
             val_img_feature = torch.stack(bucket["val_img_features"])
-            gallery_sizes.append(len(bucket["val_img_names"]))
-            evaluated_ranks = []
-
+            
+            if len(bucket["val_img_features"]) == 0:
+                print("rank: ", rank)
+                print(category)
+                continue
             for num, sketch_feature in enumerate(bucket["val_sk_features"]):
                 s_name = bucket["val_sk_names"][num]
-                sk_query_name = extract_instance_id(s_name)
-
-                if sk_query_name not in bucket["val_img_names"]:
-                    skipped_queries += 1
-                    continue
-
+                sk_query_name = s_name.split('/')[-1].split('-')[:-1][0]
+                
                 position_query = bucket["val_img_names"].index(sk_query_name)
                 
                 distance = F.pairwise_distance(sketch_feature.unsqueeze(0), val_img_feature)
@@ -262,28 +289,14 @@ class ZS_SBIR(pl.LightningModule):
                     val_img_feature[position_query].unsqueeze(0)
                 )
                 
-                evaluated_ranks.append(distance.le(target_distance).sum().item())
-
-            if len(evaluated_ranks) == 0:
-                continue
-
-            rank = torch.tensor(evaluated_ranks)
-            top1_total = top1_total + rank.le(1).sum().item()
-            top5_total = top5_total + rank.le(5).sum().item()
-            total_sk = total_sk + len(evaluated_ranks)
+                rank[num] = distance.le(target_distance).sum()
                 
-        if total_sk == 0:
-            top1, top5 = 0.0, 0.0
-        else:
-            top1 = top1_total / total_sk
-            top5 = top5_total / total_sk
-
-        if len(gallery_sizes) > 0:
-            print(
-                f"Val gallery size/category -> min: {min(gallery_sizes)}, max: {max(gallery_sizes)}, mean: {sum(gallery_sizes)/len(gallery_sizes):.2f}"
-            )
-        if skipped_queries > 0:
-            print(f"Skipped queries (no matching positive name in gallery): {skipped_queries}")
+            top1_total = top1_total + rank.le(1).sum().numpy()
+            top5_total = top5_total + rank.le(5).sum().numpy()
+            total_sk = total_sk + rank.shape[0]
+                
+        top1 = top1_total / total_sk
+        top5 = top5_total / total_sk
         
         self.log("top1", top1, on_step=False, on_epoch=True)
         print('top1: {}, top5: {}'.format(top1, top5))

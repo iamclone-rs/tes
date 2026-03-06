@@ -4,12 +4,10 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 def cross_loss(feature_1, feature_2, args):
-    labels = torch.cat([torch.arange(len(feature_1)) for _ in range(2)], dim=0)
+    feat_device = feature_1.device
+    labels = torch.cat([torch.arange(len(feature_1), device=feat_device) for _ in range(2)], dim=0)
     labels = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
-    labels = labels.to(device)
 
     feature_1 = F.normalize(feature_1, dim=1)
     feature_2 = F.normalize(feature_2, dim=1)
@@ -18,7 +16,7 @@ def cross_loss(feature_1, feature_2, args):
     similarity_matrix = torch.matmul(features, features.T)  # (2*B, 2*B)
 
     # discard the main diagonal from both: labels and similarities matrix
-    mask = torch.eye(labels.shape[0], dtype=torch.bool).to(device)
+    mask = torch.eye(labels.shape[0], dtype=torch.bool, device=feat_device)
     labels = labels[~mask].view(labels.shape[0], -1)
     similarity_matrix = similarity_matrix[~mask].view(similarity_matrix.shape[0], -1)  # (2*B, 2*B - 1)
 
@@ -27,19 +25,30 @@ def cross_loss(feature_1, feature_2, args):
     negatives = similarity_matrix[~labels.bool()].view(similarity_matrix.shape[0], -1)  # (2*B, 2*(B - 1))
 
     logits = torch.cat([positives, negatives], dim=1)
-    labels = torch.zeros(logits.shape[0], dtype=torch.long).to(device)
+    labels = torch.zeros(logits.shape[0], dtype=torch.long, device=feat_device)
 
     logits = logits / args.temperature
 
     return nn.CrossEntropyLoss()(logits, labels)
 
-def conditional_cross_modal_jigsaw_loss(logits_r, logits_pos, logits_neg, perm_idx, margin=0.0):
-    perm_idx = perm_idx.to(logits_r.device)
-    loss_ce = F.cross_entropy(logits_r, perm_idx)
-    loss_pos = F.cross_entropy(logits_pos, perm_idx)
-    loss_neg = F.cross_entropy(logits_neg, perm_idx)
-    loss_margin = F.relu(margin + loss_pos - loss_neg)
-    return loss_ce + loss_margin
+def conditional_cross_modal_jigsaw_loss(
+    jig_logits_r: torch.Tensor,
+    jig_logits_pos: torch.Tensor,
+    jig_logits_neg: torch.Tensor,
+    perm_idx: torch.Tensor,
+) -> torch.Tensor:
+    """
+    SpLIP (ECCV 2024) conditional cross-modal jigsaw loss (Eq. 9-10):
+      Lcjs = Lce(Fjs(r), yperm) + [ Lce(Fjs(r+), yperm) - Lce(Fjs(r-), yperm) ]_+
+    """
+    perm_idx = perm_idx.to(device=jig_logits_r.device, dtype=torch.long)
+
+    ce_r = F.cross_entropy(jig_logits_r, perm_idx)
+    ce_pos = F.cross_entropy(jig_logits_pos, perm_idx, reduction="none")
+    ce_neg = F.cross_entropy(jig_logits_neg, perm_idx, reduction="none")
+    margin = F.relu(ce_pos - ce_neg).mean()
+
+    return ce_r + margin
 
 def xmodal_infonce(sk, im, temperature=0.07):
     """
@@ -57,7 +66,7 @@ def xmodal_infonce(sk, im, temperature=0.07):
 
 def loss_fn(args, model, features, mode='train'):
     photo_features_norm, sk_feature_norm, neg_feature_norm, photo_aug_features, sk_aug_features, \
-            label, pos_logits, sk_logits, photo_feature, sk_feature, cjs_logits_r, cjs_logits_pos, cjs_logits_neg, perm_idx = features
+            label, pos_logits, sk_logits, photo_feature, sk_feature, jig_logits_r, jig_logits_pos, jig_logits_neg, perm_idx = features
 
     label = label.to(pos_logits.device)
     
@@ -73,14 +82,15 @@ def loss_fn(args, model, features, mode='train'):
     # triplet = nn.TripletMarginWithDistanceLoss(distance_function=distance_fn, margin=0.3)
     triplet = nn.TripletMarginLoss(margin=0.3)
     loss_triplet = triplet(sk_feature_norm, photo_features_norm, neg_feature_norm)
-
-    cjs_margin = getattr(args, "cjs_margin", 0.0)
-    cjs_loss = conditional_cross_modal_jigsaw_loss(
-        logits_r=cjs_logits_r,
-        logits_pos=cjs_logits_pos,
-        logits_neg=cjs_logits_neg,
+    
+    loss_cjs = conditional_cross_modal_jigsaw_loss(
+        jig_logits_r=jig_logits_r,
+        jig_logits_pos=jig_logits_pos,
+        jig_logits_neg=jig_logits_neg,
         perm_idx=perm_idx,
-        margin=cjs_margin,
     )
+    
+    alpha = float(getattr(args, "alpha", 1.0))
+    beta = float(getattr(args, "beta", 0.1))
 
-    return 10*loss_triplet + loss_cls + 2*loss_distill + 1*cjs_loss
+    return 10 * loss_triplet + alpha * loss_cls + 2 * loss_distill + beta * loss_cjs

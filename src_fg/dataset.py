@@ -1,9 +1,9 @@
 import os
+import os
 import glob
 import numpy as np
 import torch
 import math 
-import random
 from torch.nn import functional as F
 
 from torchvision import transforms
@@ -31,64 +31,6 @@ def normal_transform():
                              0.229, 0.224, 0.225])
     ])
     return dataset_transforms
-
-def split_img(img, grid=3):
-    splitimg = []
-    width, height = img.size
-    tile_w = int(width // grid)
-    tile_h = int(height // grid)
-    for row in range(grid):
-        for col in range(grid):
-            box = (tile_w * col, tile_h * row, tile_w * (col + 1), tile_h * (row + 1))
-            region = img.crop(box)
-            splitimg.append(region)
-    return splitimg
-
-def rebuild_from_perm(img, perm, grid=3):
-    tiles = split_img(img, grid=grid)
-    if torch.is_tensor(perm):
-        perm = perm.tolist()
-
-    width, height = img.size
-    tile_w = width // grid
-    tile_h = height // grid
-
-    new_img = Image.new(img.mode, (tile_w * grid, tile_h * grid))
-    for idx, src_idx in enumerate(perm):
-        row = idx // grid
-        col = idx % grid
-        new_img.paste(tiles[src_idx], (col * tile_w, row * tile_h))
-    return new_img
-
-def make_jigsaw(img, grid=3, perm=None):
-    if perm is None:
-        perm = torch.randperm(grid ** 2)
-    jig_img = rebuild_from_perm(img, perm=perm, grid=grid)
-    return jig_img, perm
-
-def extract_instance_id(file_path_or_name):
-    file_name = os.path.basename(file_path_or_name)
-    stem, _ = os.path.splitext(file_name)
-    if "-" in stem:
-        return stem.rsplit("-", 1)[0]
-    return stem
-
-def generate_permutation_bank(grid=3, num_perms=30, seed=42):
-    rng = random.Random(seed)
-    total_tiles = grid ** 2
-    base = list(range(total_tiles))
-    permutations = [tuple(base)]
-    seen = {tuple(base)}
-
-    while len(permutations) < num_perms:
-        candidate = base.copy()
-        rng.shuffle(candidate)
-        candidate_t = tuple(candidate)
-        if candidate_t not in seen:
-            seen.add(candidate_t)
-            permutations.append(candidate_t)
-
-    return [torch.tensor(p, dtype=torch.long) for p in permutations]
 
 def remove_patches_white_normalized(
     img: torch.Tensor,
@@ -151,11 +93,135 @@ def remove_patches(img, grid=2, remove_ids=[5, 9]):
         
     return Image.fromarray(img_np)
 
+def _hamming_distance(a: np.ndarray, b: np.ndarray) -> int:
+    return int(np.sum(a != b))
+
+def generate_jigsaw_permutations(
+    *,
+    num_patches: int,
+    num_permutations: int,
+    seed: int = 0,
+    exclude_identity: bool = True,
+    candidates_per_round: int = 2048,
+):
+    """
+    Greedily select permutations with large mutual Hamming distance (Noroozi & Favaro jigsaw-style).
+
+    Returns: torch.LongTensor of shape [num_permutations, num_patches]
+    """
+    if num_patches <= 1:
+        raise ValueError("num_patches must be > 1")
+    if num_permutations <= 0:
+        raise ValueError("num_permutations must be > 0")
+
+    max_unique = math.factorial(num_patches)
+    if num_permutations > max_unique - (1 if exclude_identity else 0):
+        raise ValueError(
+            f"num_permutations={num_permutations} exceeds unique permutations for num_patches={num_patches}"
+        )
+
+    rng = np.random.RandomState(seed)
+    identity = np.arange(num_patches, dtype=np.int64)
+
+    selected = []
+    selected_set = set()
+
+    def _add_perm(p: np.ndarray) -> None:
+        key = tuple(int(x) for x in p.tolist())
+        selected.append(p.copy())
+        selected_set.add(key)
+
+    # seed selection
+    if not exclude_identity:
+        _add_perm(identity)
+    else:
+        # ensure first perm is not identity
+        p = identity.copy()
+        while True:
+            rng.shuffle(p)
+            if not np.array_equal(p, identity):
+                break
+        _add_perm(p)
+
+    while len(selected) < num_permutations:
+        best = None
+        best_score = -1
+        # sample candidates and pick the one maximizing min Hamming distance to selected set
+        for _ in range(candidates_per_round):
+            cand = identity.copy()
+            rng.shuffle(cand)
+            if exclude_identity and np.array_equal(cand, identity):
+                continue
+            key = tuple(int(x) for x in cand.tolist())
+            if key in selected_set:
+                continue
+
+            score = min(_hamming_distance(cand, s) for s in selected)
+            if score > best_score:
+                best_score = score
+                best = cand
+
+        if best is None:
+            # fallback: exhaustive-ish sampling until a new permutation appears
+            while True:
+                cand = identity.copy()
+                rng.shuffle(cand)
+                if exclude_identity and np.array_equal(cand, identity):
+                    continue
+                key = tuple(int(x) for x in cand.tolist())
+                if key not in selected_set:
+                    best = cand
+                    break
+
+        _add_perm(best)
+
+    return torch.as_tensor(np.stack(selected, axis=0), dtype=torch.long)
+
+def permute_patches_tensor(img: torch.Tensor, *, grid: int, perm: torch.Tensor) -> torch.Tensor:
+    """
+    Apply a patch permutation on a normalized tensor image.
+
+    img: Tensor [C, H, W]
+    perm: Tensor [grid*grid] where perm[tgt_id] = src_id (0-indexed, row-major)
+    """
+    if img.dim() != 3:
+        raise ValueError("img must be [C,H,W]")
+    if perm.numel() != grid * grid:
+        raise ValueError("perm length must be grid*grid")
+
+    img = img.clone()
+    C, H, W = img.shape
+    patch_w = W // grid
+    patch_h = H // grid
+
+    region_w = patch_w * grid
+    region_h = patch_h * grid
+
+    # Only permute the top-left divisible region; leave remainder borders intact.
+    region = img[:, :region_h, :region_w]
+    out_region = torch.empty_like(region)
+
+    perm = perm.to(device=img.device)
+    for tgt_id in range(grid * grid):
+        src_id = int(perm[tgt_id].item())
+        tgt_r, tgt_c = divmod(tgt_id, grid)
+        src_r, src_c = divmod(src_id, grid)
+
+        ys, ye = src_r * patch_h, (src_r + 1) * patch_h
+        xs, xe = src_c * patch_w, (src_c + 1) * patch_w
+        yt, yte = tgt_r * patch_h, (tgt_r + 1) * patch_h
+        xt, xte = tgt_c * patch_w, (tgt_c + 1) * patch_w
+
+        out_region[:, yt:yte, xt:xte] = region[:, ys:ye, xs:xe]
+
+    img[:, :region_h, :region_w] = out_region
+    return img
+
 class SketchyDataset(torch.utils.data.Dataset):
     def __init__(self, args, mode):
         self.args = args
         self.mode = mode
-        unseen_classes = UNSEEN_CLASSES[self.args.dataset]
+        unseen_classes = UNSEEN_CLASSES["sketchy_2"]
 
         self.all_categories = os.listdir(os.path.join(self.args.root, 'sketch'))
         self.transform = normal_transform()
@@ -168,13 +234,19 @@ class SketchyDataset(torch.utils.data.Dataset):
 
         self.all_sketches_path = []
         self.all_photos_path = {}
-        self.cjs_grid = getattr(self.args, "cjs_grid", 3)
-        self.cjs_num_perms = getattr(self.args, "cjs_num_perms", 30)
-        self.permutation_bank = generate_permutation_bank(
-            grid=self.cjs_grid,
-            num_perms=self.cjs_num_perms,
-            seed=42,
-        )
+
+        # Conditional cross-modal jigsaw settings (SpLIP-style)
+        self.jigsaw_grid = int(getattr(self.args, "jigsaw_grid", 3))
+        self.jigsaw_num_perm = int(getattr(self.args, "jigsaw_num_perm", 100))
+        self.jigsaw_seed = int(getattr(self.args, "jigsaw_seed", 0))
+        self.jigsaw_perms = None
+        if self.mode == "train":
+            self.jigsaw_perms = generate_jigsaw_permutations(
+                num_patches=self.jigsaw_grid * self.jigsaw_grid,
+                num_permutations=self.jigsaw_num_perm,
+                seed=self.jigsaw_seed,
+                exclude_identity=True,
+            )
 
         for category in self.all_categories:
             self.all_sketches_path.extend(glob.glob(os.path.join(self.args.root, 'sketch', category, '*')))
@@ -187,7 +259,7 @@ class SketchyDataset(torch.utils.data.Dataset):
         sk_path = self.all_sketches_path[index]
         category = sk_path.split(os.path.sep)[-2]
 
-        pos_sample = extract_instance_id(sk_path)
+        pos_sample = sk_path.split('/')[-1].split('-')[:-1][0]
         pos_path = glob.glob(os.path.join(self.args.root, 'photo', category, pos_sample + '.*'))
         if len(pos_path) == 0:
             print(sk_path)
@@ -210,22 +282,14 @@ class SketchyDataset(torch.utils.data.Dataset):
         if self.mode == "train":
             sk_aug_tensor = self.aumentation(sk_data)
             img_aug_tensor = self.aumentation(img_data)
-
-            perm_idx = np.random.randint(0, len(self.permutation_bank))
-            perm = self.permutation_bank[perm_idx]
-            sk_jigsaw_img, _ = make_jigsaw(sk_data, grid=self.cjs_grid, perm=perm)
-
-            sk_jigsaw = self.transform(sk_jigsaw_img)
             
-            # sk_jigsaw = remove_patches(img=sk_data, grid=3, remove_ids=[1, 9])
-            # pos_jigsaw = remove_patches(img=img_data, grid=3, remove_ids=[1, 9])
-            # neg_jigsaw = remove_patches(img=img_data, grid=3, remove_ids=[2, 8])
-            # sk_jigsaw = self.transform(sk_jigsaw)
-            # pos_jigsaw = self.transform(pos_jigsaw)
-            # neg_jigsaw = self.transform(neg_jigsaw)
+            # SpLIP-style: permute sketch patches with a sampled permutation y_perm
+            perm_idx = int(np.random.randint(0, self.jigsaw_perms.shape[0]))
+            perm = self.jigsaw_perms[perm_idx]
+            sk_perm_tensor = permute_patches_tensor(sk_tensor, grid=self.jigsaw_grid, perm=perm)
             
             return img_tensor, sk_tensor, img_aug_tensor, sk_aug_tensor, neg_tensor, \
-                sk_jigsaw, torch.tensor(perm_idx, dtype=torch.long), self.all_categories.index(category)
+                sk_perm_tensor, perm_idx, self.all_categories.index(category)
 
         else:
             return sk_tensor, sk_path, img_tensor, pos_sample, self.all_categories.index(category)

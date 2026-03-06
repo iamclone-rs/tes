@@ -52,10 +52,15 @@ if __name__ == "__main__":
     parser.add_argument("--gamma", type=float, default=0.1)
     parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--lambd", type=float, default=0.1)
-    parser.add_argument("--cjs_num_perms", type=int, default=30)
-    parser.add_argument("--cjs_grid", type=int, default=3)
-    parser.add_argument("--cjs_margin", type=float, default=0.0)
-    
+
+    # Conditional cross-modal jigsaw (SpLIP-style)
+    parser.add_argument("--jigsaw_grid", type=int, default=3, help="grid size for patch permutation (e.g., 3 -> 3x3)")
+    parser.add_argument("--jigsaw_num_perm", type=int, default=100, help="number of permutation classes |Yperm|")
+    parser.add_argument("--jigsaw_seed", type=int, default=0, help="seed for permutation set generation")
+    parser.add_argument("--jigsaw_layers", type=int, default=2, help="number of transformer encoder layers in Fjs")
+    parser.add_argument("--jigsaw_nhead", type=int, default=8, help="number of attention heads in Fjs")
+    parser.add_argument("--jigsaw_dropout", type=float, default=0.1, help="dropout for Fjs")
+     
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--test_batch_size', type=int, default=1024)
