@@ -124,7 +124,7 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--alpha", type=float, default=0.8)
     parser.add_argument("--gamma", type=float, default=0.1)
-    parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument("--beta", type=float, default=1)
     parser.add_argument("--lambd", type=float, default=0.1)
 
     # Conditional cross-modal jigsaw (SpLIP-style)
