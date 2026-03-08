@@ -123,12 +123,9 @@ if __name__ == "__main__":
     parser.add_argument("--distill", type=str, default="cosine")
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--alpha", type=float, default=0.8)
-    parser.add_argument("--gamma", type=float, default=0.1, help="weight for instance-level pos_id contrastive loss")
+    parser.add_argument("--gamma", type=float, default=0.1)
     parser.add_argument("--beta", type=float, default=1)
-    parser.add_argument("--lambd", type=float, default=1, help="weight for f-divergence loss (CLIP for All Things)")
-    parser.add_argument("--queue_size", type=int, default=0, help="cross-batch photo feature queue size for hard negatives (0 to disable)")
-    parser.add_argument("--patch_weight", type=float, default=0.0, help="weight for patch-level max-sim contrastive loss")
-    parser.add_argument("--patch_temperature", type=float, default=0.07, help="temperature for patch-level loss")
+    parser.add_argument("--lambd", type=float, default=0.1)
 
     # Conditional cross-modal jigsaw (SpLIP-style)
     parser.add_argument("--jigsaw_grid", type=int, default=3, help="grid size for patch permutation (e.g., 3 -> 3x3)")
@@ -137,6 +134,7 @@ if __name__ == "__main__":
     parser.add_argument("--jigsaw_layers", type=int, default=2, help="number of transformer encoder layers in Fjs")
     parser.add_argument("--jigsaw_nhead", type=int, default=8, help="number of attention heads in Fjs")
     parser.add_argument("--jigsaw_dropout", type=float, default=0.1, help="dropout for Fjs")
+    parser.add_argument("--xmodal_weight", type=float, default=1.0, help="weight for sketch-photo cross-modal InfoNCE")
      
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument('--batch_size', type=int, default=32)

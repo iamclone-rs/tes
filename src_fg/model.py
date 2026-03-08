@@ -72,7 +72,6 @@ class CustomCLIP(nn.Module):
         self, args, clip_model, clip_model_distill
     ):
         super().__init__()
-        self.args = args
         clip_model.apply(freeze_all_but_bn)
         clip_model_distill.apply(freeze_all_but_bn)
         self.dtype = clip_model.dtype
@@ -102,73 +101,8 @@ class CustomCLIP(nn.Module):
             nhead=jigsaw_nhead,
             dropout=jigsaw_dropout,
         )
-
-        # Cross-batch hard-negative queue (stores photo features).
-        self.queue_size = int(getattr(args, "queue_size", 0))
-        if self.queue_size > 0:
-            self.register_buffer("queue_feat", torch.zeros(self.queue_size, 512))
-            self.register_buffer("queue_label", torch.zeros(self.queue_size, dtype=torch.long))
-            self.register_buffer("queue_pos_id", torch.full((self.queue_size,), -1, dtype=torch.long))
-            self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-            self.register_buffer("queue_len", torch.zeros(1, dtype=torch.long))
-
-    @torch.no_grad()
-    def enqueue_photo_features(
-        self,
-        photo_feat: torch.Tensor,
-        label: torch.Tensor,
-        pos_id: torch.Tensor | None,
-    ) -> None:
-        if self.queue_size <= 0:
-            return
-        if photo_feat.dim() != 2 or photo_feat.size(1) != 512:
-            raise ValueError("photo_feat must be [B,512]")
-
-        photo_feat = photo_feat.detach().to(dtype=self.queue_feat.dtype)
-        label = label.detach().to(device=self.queue_label.device, dtype=torch.long).view(-1)
-        if pos_id is None:
-            pos_id = torch.full((photo_feat.size(0),), -1, device=self.queue_pos_id.device, dtype=torch.long)
-        else:
-            pos_id = pos_id.detach().to(device=self.queue_pos_id.device, dtype=torch.long).view(-1)
-
-        B = photo_feat.size(0)
-        if B == 0:
-            return
-
-        if B > self.queue_size:
-            photo_feat = photo_feat[-self.queue_size :]
-            label = label[-self.queue_size :]
-            pos_id = pos_id[-self.queue_size :]
-            B = photo_feat.size(0)
-
-        ptr = int(self.queue_ptr.item())
-        end = ptr + B
-        if end <= self.queue_size:
-            self.queue_feat[ptr:end] = photo_feat
-            self.queue_label[ptr:end] = label
-            self.queue_pos_id[ptr:end] = pos_id
-        else:
-            first = self.queue_size - ptr
-            self.queue_feat[ptr:] = photo_feat[:first]
-            self.queue_label[ptr:] = label[:first]
-            self.queue_pos_id[ptr:] = pos_id[:first]
-
-            rest = B - first
-            self.queue_feat[:rest] = photo_feat[first:]
-            self.queue_label[:rest] = label[first:]
-            self.queue_pos_id[:rest] = pos_id[first:]
-
-        self.queue_ptr[0] = (ptr + B) % self.queue_size
-        self.queue_len[0] = min(self.queue_size, int(self.queue_len.item()) + B)
     
-    def get_logits(
-        self,
-        img_tensor,
-        classnames,
-        type='photo',
-        return_text_features: bool = False,
-        return_patch_features: bool = False,
-    ):
+    def get_logits(self, img_tensor, classnames, type='photo', return_text_features: bool = False):
         if type=='photo':
             prompt_learner = self.prompt_learner_photo
         else:
@@ -187,26 +121,14 @@ class CustomCLIP(nn.Module):
             prompts, tokenized_prompts, deep_compound_prompts_text
         ) # (n_classes, 512)
         
-        image_out = self.image_encoder(
-            img_tensor.type(self.dtype),
-            shared_ctx,
-            deep_compound_prompts_vision,
-            return_tokens=return_patch_features,
-        )
-        if return_patch_features:
-            image_features, patch_features = image_out
-        else:
-            image_features, patch_features = image_out, None
+        image_features = self.image_encoder(
+                img_tensor.type(self.dtype), shared_ctx, deep_compound_prompts_vision
+            ) # (batch_size, 512)
             
         x_a = self.adapter_photo(image_features)
         image_features = (
             self.image_adapter_m * x_a + (1 - self.image_adapter_m) * image_features
         )
-        patch_features_norm = None
-        if patch_features is not None:
-            x_a_p = self.adapter_photo(patch_features)
-            patch_features = self.image_adapter_m * x_a_p + (1 - self.image_adapter_m) * patch_features
-            patch_features_norm = patch_features / patch_features.norm(dim=-1, keepdim=True)
 
         x_b = self.adapter_text(text_features)
         text_features = (
@@ -218,40 +140,20 @@ class CustomCLIP(nn.Module):
 
         logits = logit_scale * image_features_normalize @ text_features.t()
         
-        if return_text_features and return_patch_features:
-            return logits, image_features_normalize, image_features, text_features, patch_features_norm
         if return_text_features:
             return logits, image_features_normalize, image_features, text_features
-        if return_patch_features:
-            return logits, image_features_normalize, image_features, patch_features_norm
+
         return logits, image_features_normalize, image_features
         
     def forward(self, x, classnames):
         photo_tensor, sk_tensor, photo_aug_tensor, sk_aug_tensor, neg_tensor, \
             sk_perm_tensor, perm_idx, label, pos_id = x
-
-        patch_w = float(getattr(self.args, "patch_weight", 0.0))
-        need_patch = patch_w > 0
             
-        if need_patch:
-            pos_logits, photo_features_norm, photo_feature, text_features, photo_patch_features_norm = self.get_logits(
-                photo_tensor, classnames, return_text_features=True, return_patch_features=True
-            )
-            sk_logits, sk_feature_norm, sk_feature, sk_patch_features_norm = self.get_logits(
-                sk_tensor, classnames, type='sketch', return_patch_features=True
-            )
-            _, neg_feature_norm, _, neg_patch_features_norm = self.get_logits(
-                neg_tensor, classnames, return_patch_features=True
-            )
-        else:
-            pos_logits, photo_features_norm, photo_feature, text_features = self.get_logits(
-                photo_tensor, classnames, return_text_features=True
-            )
-            sk_logits, sk_feature_norm, sk_feature = self.get_logits(sk_tensor, classnames, type='sketch')
-            _, neg_feature_norm, _ = self.get_logits(neg_tensor, classnames)
-            photo_patch_features_norm = None
-            sk_patch_features_norm = None
-            neg_patch_features_norm = None
+        pos_logits, photo_features_norm, photo_feature, text_features = self.get_logits(
+            photo_tensor, classnames, return_text_features=True
+        )
+        sk_logits, sk_feature_norm, sk_feature = self.get_logits(sk_tensor, classnames, type='sketch')
+        _, neg_feature_norm, _ = self.get_logits(neg_tensor, classnames)
         
         _, sk_perm_feature_norm, _ = self.get_logits(sk_perm_tensor, classnames, type='sketch')
 
@@ -271,8 +173,7 @@ class CustomCLIP(nn.Module):
         sk_aug_features = self.model_distill.encode_image(sk_aug_tensor)
         
         return photo_features_norm, sk_feature_norm, neg_feature_norm, photo_aug_features, sk_aug_features, \
-            label, pos_logits, sk_logits, photo_feature, sk_feature, jig_logits_r, jig_logits_pos, jig_logits_neg, perm_idx, text_features, pos_id, \
-            photo_patch_features_norm, sk_patch_features_norm, neg_patch_features_norm
+            label, pos_logits, sk_logits, photo_feature, sk_feature, jig_logits_r, jig_logits_pos, jig_logits_neg, perm_idx, text_features, pos_id
             
     def extract_feature(self, image, classname, type='photo'):
         _, feature, _ = self.get_logits(image, classnames=classname, type=type)
