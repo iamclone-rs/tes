@@ -95,6 +95,89 @@ def remove_patches(img, grid=2, remove_ids=[5, 9]):
 def _hamming_distance(a: np.ndarray, b: np.ndarray) -> int:
     return int(np.sum(a != b))
 
+def _random_unique_permutations(
+    rng: np.random.RandomState,
+    identity: np.ndarray,
+    n: int,
+    *,
+    exclude_identity: bool,
+    prefilled: list[np.ndarray] | None = None,
+):
+    """
+    Generate `n` unique permutations by repeated shuffling.
+
+    NOTE: This is efficient for small n relative to num_patches! (e.g., 9 patches and n<=10k).
+    """
+    if n <= 0:
+        return np.empty((0, identity.size), dtype=np.int64)
+
+    perms: list[np.ndarray] = []
+    seen: set[tuple[int, ...]] = set()
+
+    if prefilled:
+        for p in prefilled:
+            key = tuple(int(x) for x in p.tolist())
+            if key in seen:
+                continue
+            perms.append(p.copy())
+            seen.add(key)
+
+    while len(perms) < n:
+        cand = identity.copy()
+        rng.shuffle(cand)
+        if exclude_identity and np.array_equal(cand, identity):
+            continue
+        key = tuple(int(x) for x in cand.tolist())
+        if key in seen:
+            continue
+        perms.append(cand.copy())
+        seen.add(key)
+
+    return np.stack(perms, axis=0)
+
+def _farthest_first_select(
+    pool: np.ndarray,
+    *,
+    k: int,
+    init: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Farthest-first (maximin) selection under Hamming distance.
+
+    pool: [N, P] unique permutations
+    k: number of items to select from pool
+    init: optional initial permutation used to seed distances (not necessarily in pool)
+    """
+    if k <= 0:
+        return np.empty((0, pool.shape[1]), dtype=pool.dtype)
+    if k > pool.shape[0]:
+        raise ValueError("k cannot be larger than pool size")
+
+    P = pool.shape[1]
+    if init is None:
+        first_idx = 0
+        selected_idx = np.empty(k, dtype=np.int64)
+        selected_idx[0] = first_idx
+        min_dist = np.sum(pool != pool[first_idx], axis=1, dtype=np.int16)
+        min_dist[first_idx] = -1
+        start = 1
+    else:
+        if init.shape != (P,):
+            raise ValueError("init must have shape [num_patches]")
+        selected_idx = np.empty(k, dtype=np.int64)
+        min_dist = np.sum(pool != init, axis=1, dtype=np.int16)
+        start = 0
+
+    for i in range(start, k):
+        next_idx = int(min_dist.argmax())
+        selected_idx[i] = next_idx
+
+        dist = np.sum(pool != pool[next_idx], axis=1, dtype=np.int16)
+        min_dist = np.minimum(min_dist, dist)
+        min_dist[next_idx] = -1
+
+    return pool[selected_idx]
+
 def generate_jigsaw_permutations(
     *,
     num_patches: int,
@@ -102,9 +185,15 @@ def generate_jigsaw_permutations(
     seed: int = 0,
     exclude_identity: bool = True,
     candidates_per_round: int = 2048,
+    strategy: str = "farthest",
+    pool_multiplier: int = 10,
 ):
     """
-    Greedily select permutations with large mutual Hamming distance (Noroozi & Favaro jigsaw-style).
+    Select a set of patch permutations for jigsaw classification.
+
+    Default strategy ("farthest") uses farthest-first selection on a random candidate pool.
+    This approximates Noroozi & Favaro-style "max mutual Hamming distance" sets, while
+    avoiding the O(K^2) Python-loop implementation that can appear to "hang" for K=1000.
 
     Returns: torch.LongTensor of shape [num_permutations, num_patches]
     """
@@ -112,6 +201,8 @@ def generate_jigsaw_permutations(
         raise ValueError("num_patches must be > 1")
     if num_permutations <= 0:
         raise ValueError("num_permutations must be > 0")
+    if pool_multiplier <= 0:
+        raise ValueError("pool_multiplier must be > 0")
 
     max_unique = math.factorial(num_patches)
     if num_permutations > max_unique - (1 if exclude_identity else 0):
@@ -122,59 +213,98 @@ def generate_jigsaw_permutations(
     rng = np.random.RandomState(seed)
     identity = np.arange(num_patches, dtype=np.int64)
 
-    selected = []
-    selected_set = set()
+    strategy = str(strategy).strip().lower()
+    if strategy not in {"farthest", "random", "legacy"}:
+        raise ValueError("strategy must be one of: farthest | random | legacy")
 
-    def _add_perm(p: np.ndarray) -> None:
-        key = tuple(int(x) for x in p.tolist())
-        selected.append(p.copy())
-        selected_set.add(key)
+    # Fast path: random unique permutations (good enough for most training runs).
+    if strategy == "random":
+        if exclude_identity:
+            arr = _random_unique_permutations(rng, identity, num_permutations, exclude_identity=True)
+            return torch.as_tensor(arr, dtype=torch.long)
 
-    # seed selection
-    if not exclude_identity:
-        _add_perm(identity)
-    else:
-        # ensure first perm is not identity
-        p = identity.copy()
-        while True:
-            rng.shuffle(p)
-            if not np.array_equal(p, identity):
-                break
-        _add_perm(p)
+        prefilled = [identity]
+        arr_rest = _random_unique_permutations(
+            rng,
+            identity,
+            num_permutations - 1,
+            exclude_identity=True,
+        )
+        arr = np.concatenate([np.stack(prefilled, axis=0), arr_rest], axis=0)
+        return torch.as_tensor(arr, dtype=torch.long)
 
-    while len(selected) < num_permutations:
-        best = None
-        best_score = -1
-        # sample candidates and pick the one maximizing min Hamming distance to selected set
-        for _ in range(candidates_per_round):
-            cand = identity.copy()
-            rng.shuffle(cand)
-            if exclude_identity and np.array_equal(cand, identity):
-                continue
-            key = tuple(int(x) for x in cand.tolist())
-            if key in selected_set:
-                continue
+    # Legacy Python-loop greedy (kept for reference; can be very slow for K=1000).
+    if strategy == "legacy":
+        selected = []
+        selected_set = set()
 
-            score = min(_hamming_distance(cand, s) for s in selected)
-            if score > best_score:
-                best_score = score
-                best = cand
+        def _add_perm(p: np.ndarray) -> None:
+            key = tuple(int(x) for x in p.tolist())
+            selected.append(p.copy())
+            selected_set.add(key)
 
-        if best is None:
-            # fallback: exhaustive-ish sampling until a new permutation appears
+        # seed selection
+        if not exclude_identity:
+            _add_perm(identity)
+        else:
+            # ensure first perm is not identity
+            p = identity.copy()
             while True:
+                rng.shuffle(p)
+                if not np.array_equal(p, identity):
+                    break
+            _add_perm(p)
+
+        while len(selected) < num_permutations:
+            best = None
+            best_score = -1
+            # sample candidates and pick the one maximizing min Hamming distance to selected set
+            for _ in range(candidates_per_round):
                 cand = identity.copy()
                 rng.shuffle(cand)
                 if exclude_identity and np.array_equal(cand, identity):
                     continue
                 key = tuple(int(x) for x in cand.tolist())
-                if key not in selected_set:
+                if key in selected_set:
+                    continue
+
+                score = min(_hamming_distance(cand, s) for s in selected)
+                if score > best_score:
+                    best_score = score
                     best = cand
-                    break
 
-        _add_perm(best)
+            if best is None:
+                # fallback: sampling until a new permutation appears
+                while True:
+                    cand = identity.copy()
+                    rng.shuffle(cand)
+                    if exclude_identity and np.array_equal(cand, identity):
+                        continue
+                    key = tuple(int(x) for x in cand.tolist())
+                    if key not in selected_set:
+                        best = cand
+                        break
 
-    return torch.as_tensor(np.stack(selected, axis=0), dtype=torch.long)
+            _add_perm(best)
+
+        return torch.as_tensor(np.stack(selected, axis=0), dtype=torch.long)
+
+    # Default: farthest-first selection on a candidate pool.
+    available = max_unique - (1 if exclude_identity else 0)
+    pool_size = max(int(candidates_per_round), int(num_permutations) * int(pool_multiplier))
+    pool_size = max(pool_size, int(num_permutations))
+    pool_size = min(pool_size, int(available))
+
+    if exclude_identity:
+        pool = _random_unique_permutations(rng, identity, pool_size, exclude_identity=True)
+        selected = _farthest_first_select(pool, k=num_permutations)
+        return torch.as_tensor(selected, dtype=torch.long)
+
+    # include identity as the first permutation if identity is allowed
+    pool = _random_unique_permutations(rng, identity, pool_size, exclude_identity=True)
+    selected_rest = _farthest_first_select(pool, k=num_permutations - 1, init=identity)
+    out = np.concatenate([identity.reshape(1, -1), selected_rest], axis=0)
+    return torch.as_tensor(out, dtype=torch.long)
 
 def permute_patches_tensor(img: torch.Tensor, *, grid: int, perm: torch.Tensor) -> torch.Tensor:
     """
@@ -220,7 +350,7 @@ class SketchyDataset(torch.utils.data.Dataset):
     def __init__(self, args, mode):
         self.args = args
         self.mode = mode
-        unseen_classes = UNSEEN_CLASSES["sketchy_2"]
+        unseen_classes = UNSEEN_CLASSES[getattr(self.args, "dataset", "sketchy_2")]
 
         self.all_categories = os.listdir(os.path.join(self.args.root, 'sketch'))
         self.transform = normal_transform()
@@ -239,6 +369,9 @@ class SketchyDataset(torch.utils.data.Dataset):
         self.jigsaw_grid = int(getattr(self.args, "jigsaw_grid", 3))
         self.jigsaw_num_perm = int(getattr(self.args, "jigsaw_num_perm", 100))
         self.jigsaw_seed = int(getattr(self.args, "jigsaw_seed", 0))
+        self.jigsaw_perm_strategy = str(getattr(self.args, "jigsaw_perm_strategy", "farthest"))
+        self.jigsaw_perm_pool_mult = int(getattr(self.args, "jigsaw_perm_pool_mult", 10))
+        self.jigsaw_perm_pool_min = int(getattr(self.args, "jigsaw_perm_pool_min", 2048))
         self.jigsaw_perms = None
         if self.mode == "train":
             self.jigsaw_perms = generate_jigsaw_permutations(
@@ -246,6 +379,9 @@ class SketchyDataset(torch.utils.data.Dataset):
                 num_permutations=self.jigsaw_num_perm,
                 seed=self.jigsaw_seed,
                 exclude_identity=True,
+                strategy=self.jigsaw_perm_strategy,
+                pool_multiplier=self.jigsaw_perm_pool_mult,
+                candidates_per_round=self.jigsaw_perm_pool_min,
             )
 
         for category in self.all_categories:

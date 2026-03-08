@@ -177,4 +177,4 @@ def loss_fn(args, model, features, mode='train'):
     alpha = float(getattr(args, "alpha", 1.0))
     beta = float(getattr(args, "beta", 0.1))
 
-    return 10 * loss_triplet + alpha * loss_cls + 2 * loss_distill + beta * loss_cjs
+    return  loss_triplet +  loss_cls +  loss_distill + beta * loss_cjs
