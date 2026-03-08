@@ -125,7 +125,7 @@ if __name__ == "__main__":
     parser.add_argument("--alpha", type=float, default=0.8)
     parser.add_argument("--gamma", type=float, default=0.1)
     parser.add_argument("--beta", type=float, default=1)
-    parser.add_argument("--lambd", type=float, default=0.1)
+    parser.add_argument("--lambd", type=float, default=1, help="weight for f-divergence loss (CLIP for All Things)")
 
     # Conditional cross-modal jigsaw (SpLIP-style)
     parser.add_argument("--jigsaw_grid", type=int, default=3, help="grid size for patch permutation (e.g., 3 -> 3x3)")

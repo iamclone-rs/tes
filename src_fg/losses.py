@@ -4,6 +4,71 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+def f_divergence_uniform_relative_distance_loss(
+    delta: torch.Tensor,
+    label: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+    min_per_class: int = 2,
+) -> torch.Tensor:
+    """
+    "CLIP for All Things" f-divergence regularizer (Eq. 4) for multi-category FG-ZS-SBIR.
+
+    Relative distance for a triplet:
+      δ(s, p+, p-) = d(s, p+) - d(s, p-)
+
+    For each category c present in the batch, form a discrete distribution:
+      D_c = softmax({δ_i}_{i=1..N_s})
+
+    Then minimize the average KL divergence over all ordered category pairs:
+      L_δ = avg_{c!=c'} KL(D_c || D_c')
+
+    Notes:
+    - This is computed within a mini-batch; it is most stable with PK sampling (same N_s per class).
+    - If per-class counts differ (e.g., due to filtering None samples), we truncate each class to the
+      minimum count among the classes used.
+    """
+    if delta.numel() == 0:
+        return delta.new_tensor(0.0)
+
+    delta = delta.view(-1)
+    label = label.view(-1).to(device=delta.device, dtype=torch.long)
+    if delta.numel() != label.numel():
+        raise ValueError("delta and label must have the same number of elements")
+
+    uniq, counts = torch.unique(label, return_counts=True)
+    keep = counts.ge(int(min_per_class))
+    uniq = uniq[keep]
+    counts = counts[keep]
+
+    if uniq.numel() < 2:
+        return delta.new_tensor(0.0)
+
+    m = int(counts.min().item())
+    if m < int(min_per_class):
+        return delta.new_tensor(0.0)
+
+    # Gather per-category delta vectors of equal length m.
+    per_cat = []
+    for lab in uniq:
+        idx = torch.nonzero(label.eq(lab), as_tuple=False).squeeze(1)
+        if idx.numel() < m:
+            continue
+        per_cat.append(delta[idx[:m]])
+
+    if len(per_cat) < 2:
+        return delta.new_tensor(0.0)
+
+    delta_mat = torch.stack(per_cat, dim=0)  # [C, m]
+    D = F.softmax(delta_mat, dim=1)
+    logD = torch.log(D.clamp_min(eps))
+
+    # KL matrix over ordered pairs: KL(i||j) = sum_k D_i,k (logD_i,k - logD_j,k)
+    kl = (D.unsqueeze(1) * (logD.unsqueeze(1) - logD.unsqueeze(0))).sum(dim=2)  # [C, C]
+    C = kl.size(0)
+    kl = kl - torch.diag_embed(torch.diagonal(kl))  # zero diagonal
+    return kl.sum() / (C * (C - 1))
+
 def cross_loss(feature_1, feature_2, args):
     feat_device = feature_1.device
     labels = torch.cat([torch.arange(len(feature_1), device=feat_device) for _ in range(2)], dim=0)
@@ -155,6 +220,13 @@ def loss_fn(args, model, features, mode='train'):
         pos_id=pos_id,
     )
 
+    # f-divergence loss (CLIP for All Things): stabilize relative distances across categories.
+    # Use squared L2 on normalized features, consistent with our triplet implementation.
+    d_pos = (sk_feature_norm.float() - photo_features_norm.float()).pow(2).sum(dim=1)
+    d_neg = (sk_feature_norm.float() - mined_neg_feat.float()).pow(2).sum(dim=1)
+    delta = d_pos - d_neg
+    loss_fdiv = f_divergence_uniform_relative_distance_loss(delta, label)
+
     # Adaptive margin (SpLIP): mu(c+, c-) = cos(Ft(c+), Ft(c-))
     text_features = text_features.to(device=pos_logits.device)
     text_features = F.normalize(text_features.float(), dim=1)
@@ -176,5 +248,6 @@ def loss_fn(args, model, features, mode='train'):
     
     alpha = float(getattr(args, "alpha", 1.0))
     beta = float(getattr(args, "beta", 0.1))
+    lambd = float(getattr(args, "lambd", 0.0))
 
-    return 10 * loss_triplet +  loss_cls + 2 * loss_distill + beta * loss_cjs
+    return 10 * loss_triplet + alpha * loss_cls + 2 * loss_distill + beta * loss_cjs + lambd * loss_fdiv
