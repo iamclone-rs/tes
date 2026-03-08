@@ -610,7 +610,7 @@ class VisionTransformer_MaPLe(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor, shared_ctx, compound_deeper_prompts):
+    def forward(self, x: torch.Tensor, shared_ctx, compound_deeper_prompts, return_tokens: bool = False):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -645,11 +645,17 @@ class VisionTransformer_MaPLe(nn.Module):
         x = outputs[0]
         x = x.permute(1, 0, 2)  # LND -> NLD
 
-        x = self.ln_post(x[:, 0, :])
+        if return_tokens:
+            x = self.ln_post(x)
+            if self.proj is not None:
+                x = x @ self.proj
 
+            num_patches = self.positional_embedding.shape[0] - 1
+            return x[:, 0, :], x[:, 1 : 1 + num_patches, :]
+
+        x = self.ln_post(x[:, 0, :])
         if self.proj is not None:
             x = x @ self.proj
-
         return x
 
 
