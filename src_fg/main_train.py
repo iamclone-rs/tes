@@ -129,7 +129,7 @@ if __name__ == "__main__":
 
     # Conditional cross-modal jigsaw (SpLIP-style)
     parser.add_argument("--jigsaw_grid", type=int, default=3, help="grid size for patch permutation (e.g., 3 -> 3x3)")
-    parser.add_argument("--jigsaw_num_perm", type=int, default=100, help="number of permutation classes |Yperm|")
+    parser.add_argument("--jigsaw_num_perm", type=int, default=1000, help="number of permutation classes |Yperm|")
     parser.add_argument("--jigsaw_seed", type=int, default=0, help="seed for permutation set generation")
     parser.add_argument("--jigsaw_layers", type=int, default=2, help="number of transformer encoder layers in Fjs")
     parser.add_argument("--jigsaw_nhead", type=int, default=8, help="number of attention heads in Fjs")
