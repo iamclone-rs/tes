@@ -5,6 +5,10 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _loss_weight(args, name, default=1.0):
+    return getattr(args, name, default)
   
 def mcc_loss(sk_feature, photo_feature):
     l1 = nn.L1Loss()
@@ -76,4 +80,10 @@ def loss_fn(args, model, features, mode='train'):
     
     loss_photo_skt = cross_loss(photo_features, sk_features, args)
 
-    return loss_triplet + loss_photo_skt + loss_distill + loss_cls + loss_mcc
+    return (
+        _loss_weight(args, "w_triplet") * loss_triplet
+        + _loss_weight(args, "w_cross") * loss_photo_skt
+        + _loss_weight(args, "w_distill") * loss_distill
+        + _loss_weight(args, "w_cls") * loss_cls
+        + _loss_weight(args, "w_mcc") * loss_mcc
+    )

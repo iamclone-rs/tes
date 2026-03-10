@@ -47,44 +47,47 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=str, default="../datasets/tuberlin", help="path to dataset")
     parser.add_argument("--ckpt_path", type=str, default="", help="path to dataset")
-    parser.add_argument("--dataset", type=str, default="tuberlin", help="type of dataset")
+    parser.add_argument("--dataset", type=str, default="sketchy_2", help="type of dataset")
     parser.add_argument("--output_dir", type=str, default="", help="output directory")
     parser.add_argument("--backbone", type=str, default="ViT-B/32")
     parser.add_argument("--n_ctx", type=int, default=2)
     parser.add_argument("--img_ctx", type=int, default=2)
     parser.add_argument("--max_size", type=int, default=224)
     parser.add_argument("--prompt_depth", type=int, default=12)
-    parser.add_argument("--data_split", type=int, default=-1)
+    parser.add_argument("--data_split", type=int, default=-1, help="zero-shot split id for Sketchy/FG-SBIR: 1 or 2; -1 defaults to split 2")
     parser.add_argument("--prec", type=str, default="fp16")
     parser.add_argument("--distill", type=str, default="cosine")
     parser.add_argument("--temperature", type=float, default=0.07)
-    parser.add_argument("--alpha", type=float, default=0.8)
-    parser.add_argument("--gamma", type=float, default=0.1)
-    parser.add_argument("--beta", type=float, default=0.1)
-    parser.add_argument("--lambd", type=float, default=0.1)
+    parser.add_argument("--w_triplet", type=float, default=1.0, help="weight for triplet loss")
+    parser.add_argument("--w_cross", type=float, default=1.0, help="weight for cross-modal contrastive loss")
+    parser.add_argument("--w_distill", type=float, default=1.0, help="weight for distillation loss")
+    parser.add_argument("--w_cls", type=float, default=1.0, help="weight for classification loss")
+    parser.add_argument("--w_mcc", type=float, default=1.0, help="weight for MCC loss")
     
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--test_batch_size', type=int, default=1024)
-    parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--workers', type=int, default=2)
+    parser.add_argument('--epochs', type=int, default=60)
+    parser.add_argument('--workers', type=int, default=12)
     parser.add_argument('--use_adapt_sk', type=bool, default=True)
     parser.add_argument('--use_adapt_ph', type=bool, default=True)
     parser.add_argument('--use_adapt_txt', type=bool, default=True)
     parser.add_argument('--use_co_sk', type=bool, default=True)
     parser.add_argument('--use_co_ph', type=bool, default=True)
-    parser.add_argument('--progress', type=bool, default=False)
+    parser.add_argument('--progress', type=bool, default=False, help=argparse.SUPPRESS)
     parser.add_argument('--use_subset', type=bool, default=False)
     
     parser.add_argument('--exp_name', type=str, default='Co_prompt')
     
     args = parser.parse_args()
     logger = TensorBoardLogger('tb_logs', name=args.exp_name)
+    monitor_metric = 'acc1'
+    checkpoint_name = "{epoch:02d}-{acc1:.4f}"
     
     checkpoint_callback = ModelCheckpoint(
-        monitor='mAP',
+        monitor=monitor_metric,
         dirpath='saved_models/%s'%args.exp_name,
-        filename="{epoch:02d}-{mAP:.4f}",
+        filename=checkpoint_name,
         save_top_k=1,
         mode='max',
         save_last=True)
@@ -101,7 +104,9 @@ if __name__ == "__main__":
         benchmark=True,
         logger=logger,
         check_val_every_n_epoch=1,
-        enable_progress_bar=args.progress,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        num_sanity_val_steps=0,
         callbacks=[checkpoint_callback]
     )
 

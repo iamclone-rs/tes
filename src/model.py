@@ -1,17 +1,12 @@
-import copy
 import numpy as np
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 from torch.nn import functional as F
 
-from torchmetrics.functional import retrieval_average_precision, retrieval_precision
-
 from src.coprompt import MultiModalPromptLearner, Adapter, TextEncoder
-from src.utils import load_clip_to_cpu, get_all_categories
+from src.utils import load_clip_to_cpu, get_all_categories, is_fg_dataset
 from src.losses import loss_fn
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def freeze_model(m):
     m.requires_grad_(False)
@@ -126,6 +121,7 @@ class ZS_SBIR(pl.LightningModule):
         super(ZS_SBIR, self).__init__()
         self.args = args
         self.classname = classname
+        self.is_fg = is_fg_dataset(args)
         clip_model = load_clip_to_cpu(args)
         
         design_details = {
@@ -137,13 +133,28 @@ class ZS_SBIR(pl.LightningModule):
         }
         clip_model_distill = load_clip_to_cpu(args, design_details=design_details)
         
-        self.distance_fn = lambda x, y: F.cosine_similarity(x, y)
         self.best_metric = 1e-3
         
         self.model = CustomCLIP(cfg=args, clip_model=clip_model, clip_model_distill=clip_model_distill)
     
         self.val_step_outputs_sk = []
         self.val_step_outputs_ph = []
+
+    def _epoch_prefix(self):
+        return f"Epoch {self.current_epoch + 1}"
+
+    def _log_epoch_metrics(self, acc1, acc5):
+        self.log("acc1", acc1, on_step=False, on_epoch=True)
+        self.log("acc5", acc5, on_step=False, on_epoch=True)
+        if self.global_step > 0:
+            self.best_metric = self.best_metric if (self.best_metric > acc1) else acc1
+
+        train_loss = self.trainer.callback_metrics.get("train_loss", None)
+        train_loss_str = f"{train_loss.item():.6f}" if train_loss is not None else "n/a"
+        print(
+            f"{self._epoch_prefix()} | train_loss={train_loss_str} | "
+            f"acc@1={acc1:.6f} | acc@5={acc5:.6f} | best_acc@1={self.best_metric:.6f}"
+        )
         
         
     def configure_optimizers(self):
@@ -168,17 +179,31 @@ class ZS_SBIR(pl.LightningModule):
         self.log('train_loss', loss, on_step=False, on_epoch=True)
         return loss
     
-    def validation_step(self, batch, batch_idx, dataloader_idx):
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
         classnames = get_all_categories(self.args, mode="test")
-        image_tensor, label = batch
+        if self.is_fg:
+            image_tensor, label, instance_id = batch
+        else:
+            image_tensor, label = batch
+
         if dataloader_idx == 0:
             feat = self.model.extract_feature(image_tensor, classname=classnames, type='sketch')
-            self.val_step_outputs_sk.append((feat, label))
+            if self.is_fg:
+                self.val_step_outputs_sk.append((feat.detach().cpu(), label.detach().cpu(), list(instance_id)))
+            else:
+                self.val_step_outputs_sk.append((feat, label))
         else:
             feat = self.model.extract_feature(image_tensor, classname=classnames, type='photo')
-            self.val_step_outputs_ph.append((feat, label))
+            if self.is_fg:
+                self.val_step_outputs_ph.append((feat.detach().cpu(), label.detach().cpu(), list(instance_id)))
+            else:
+                self.val_step_outputs_ph.append((feat, label))
     
     def on_validation_epoch_end(self):
+        if self.is_fg:
+            self._on_validation_epoch_end_fg()
+            return
+
         query_len = len(self.val_step_outputs_sk)
         gallery_len = len(self.val_step_outputs_ph)
         
@@ -187,49 +212,76 @@ class ZS_SBIR(pl.LightningModule):
         
         all_sketch_category = np.array(sum([list(self.val_step_outputs_sk[i][1].detach().cpu().numpy()) for i in range(query_len)], []))
         all_photo_category = np.array(sum([list(self.val_step_outputs_ph[i][1].detach().cpu().numpy()) for i in range(gallery_len)], []))
-        
-        ## mAP category-level SBIR Metrics
-        gallery = gallery_feat_all
-        ap = torch.zeros(len(query_feat_all))
-        precision = torch.zeros(len(query_feat_all))
-        if self.args.dataset == "sketchy_2":
-            map_k = 200
-            p_k = 200
-        else:
-            map_k = 0
-            if self.args.dataset == "quickdraw":
-                p_k = 200
-            else:
-                p_k = 100
-                
+
+        acc1_total, acc5_total, total_sk = 0, 0, 0
         for idx, sk_feat in enumerate(query_feat_all):
             category = all_sketch_category[idx]
-            distance = self.distance_fn(sk_feat.unsqueeze(0), gallery)
-            target = torch.zeros(len(gallery), dtype=torch.bool, device=device)
-            target[np.where(all_photo_category == category)] = True
-            
-            if map_k != 0:
-                top_k_actual = min(map_k, len(gallery)) 
-                ap[idx] = retrieval_average_precision(distance.cpu(), target.cpu(), top_k=top_k_actual)
-            else: 
-                ap[idx] = retrieval_average_precision(distance.cpu(), target.cpu())
-                
-            precision[idx] = retrieval_precision(distance.cpu(), target.cpu(), top_k=p_k)
-            
-            
-        mAP = torch.mean(ap)
-        precision = torch.mean(precision)
-        self.log("mAP", mAP, on_step=False, on_epoch=True)
-        if self.global_step > 0:
-            self.best_metric = self.best_metric if  (self.best_metric > mAP.item()) else mAP.item()
-        
-        if map_k != 0:
-            print('mAP@{}: {}, P@{}: {}, Best mAP: {}'.format(map_k, mAP.item(), p_k, precision, self.best_metric))
-        else:
-            print('mAP@all: {}, P@{}: {}, Best mAP: {}'.format(mAP.item(), p_k, precision, self.best_metric))
-        train_loss = self.trainer.callback_metrics.get("train_loss", None)
+            similarity = F.cosine_similarity(sk_feat.unsqueeze(0), gallery_feat_all)
+            ranking = torch.argsort(similarity, descending=True)
+            target = torch.from_numpy(all_photo_category == category)
 
-        if train_loss is not None:
-            print(f"Train loss (epoch avg): {train_loss.item():.6f}")
+            top1_idx = ranking[:1].cpu()
+            top5_idx = ranking[: min(5, ranking.numel())].cpu()
+            acc1_total += int(target[top1_idx].any().item())
+            acc5_total += int(target[top5_idx].any().item())
+            total_sk += 1
+
+        acc1 = acc1_total / total_sk if total_sk else 0.0
+        acc5 = acc5_total / total_sk if total_sk else 0.0
+        self._log_epoch_metrics(acc1, acc5)
+        self.val_step_outputs_sk.clear()
+        self.val_step_outputs_ph.clear()
+
+    def _on_validation_epoch_end_fg(self):
+        query_len = len(self.val_step_outputs_sk)
+        gallery_len = len(self.val_step_outputs_ph)
+        if query_len == 0 or gallery_len == 0:
+            self.val_step_outputs_sk.clear()
+            self.val_step_outputs_ph.clear()
+            return
+
+        query_feat_all = torch.cat([self.val_step_outputs_sk[i][0] for i in range(query_len)])
+        gallery_feat_all = torch.cat([self.val_step_outputs_ph[i][0] for i in range(gallery_len)])
+
+        all_sketch_category = np.concatenate([
+            self.val_step_outputs_sk[i][1].numpy() for i in range(query_len)
+        ])
+        all_photo_category = np.concatenate([
+            self.val_step_outputs_ph[i][1].numpy() for i in range(gallery_len)
+        ])
+        all_sketch_instance = sum([self.val_step_outputs_sk[i][2] for i in range(query_len)], [])
+        all_photo_instance = sum([self.val_step_outputs_ph[i][2] for i in range(gallery_len)], [])
+
+        acc1_total, acc5_total, total_sk = 0, 0, 0
+        for idx, sk_feat in enumerate(query_feat_all):
+            category = all_sketch_category[idx]
+            gallery_indices = np.where(all_photo_category == category)[0]
+            if gallery_indices.size == 0:
+                continue
+
+            target_instance = all_sketch_instance[idx]
+            target_positions = [
+                local_idx for local_idx, gallery_idx in enumerate(gallery_indices)
+                if all_photo_instance[gallery_idx] == target_instance
+            ]
+            if not target_positions:
+                continue
+
+            category_gallery = gallery_feat_all[gallery_indices]
+            distance = 1.0 - F.cosine_similarity(sk_feat.unsqueeze(0), category_gallery)
+            ranking = torch.argsort(distance)
+            best_rank = min(
+                int((ranking == target_position).nonzero(as_tuple=False)[0].item()) + 1
+                for target_position in target_positions
+            )
+
+            acc1_total += int(best_rank <= 1)
+            acc5_total += int(best_rank <= 5)
+            total_sk += 1
+
+        acc1 = acc1_total / total_sk if total_sk else 0.0
+        acc5 = acc5_total / total_sk if total_sk else 0.0
+        self._log_epoch_metrics(acc1, acc5)
+
         self.val_step_outputs_sk.clear()
         self.val_step_outputs_ph.clear()

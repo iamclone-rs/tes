@@ -9,6 +9,28 @@ from torch.nn import functional as F
 from clip import clip
 from src.data_config import UNSEEN_CLASSES
 
+FG_DATASETS = {"sketchy_fg", "fg_sbir"}
+
+
+def is_fg_dataset_name(dataset_name):
+    normalized_name = str(dataset_name).strip().lower().replace("-", "_")
+    return normalized_name in FG_DATASETS
+
+
+def is_fg_dataset(args):
+    return is_fg_dataset_name(getattr(args, "dataset", ""))
+
+
+def get_zero_shot_split_key(args):
+    dataset_name = str(getattr(args, "dataset", "")).strip().lower().replace("-", "_")
+    if dataset_name in FG_DATASETS:
+        split = int(getattr(args, "data_split", -1))
+        if split == 1:
+            return "sketchy_1"
+        return "sketchy_2"
+    return getattr(args, "dataset", "")
+
+
 def retrieval_average_precision(preds, target, top_k = None):
     top_k = top_k or preds.shape[-1]
     if not isinstance(top_k, int) and top_k <= 0:
@@ -25,13 +47,19 @@ def retrieval_average_precision(preds, target, top_k = None):
 
 def get_all_categories(args, mode="train"):
     all_categories = os.listdir(os.path.join(args.root, 'sketch'))
-    unseen_classes = UNSEEN_CLASSES[args.dataset]
     if '.ipynb_checkpoints' in all_categories:
         all_categories.remove('.ipynb_checkpoints')
+    all_categories = sorted(all_categories)
+
+    split_key = get_zero_shot_split_key(args)
+    if split_key not in UNSEEN_CLASSES:
+        return all_categories
+
+    unseen_classes = UNSEEN_CLASSES[split_key]
     if mode=="train":
         all_categories = sorted(list(set(all_categories) - set(unseen_classes)))
     else:
-        all_categories = sorted(unseen_classes)
+        all_categories = sorted([category for category in unseen_classes if category in all_categories])
     return all_categories
 
 def get_clones(module, N):
