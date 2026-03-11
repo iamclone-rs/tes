@@ -93,7 +93,7 @@ class CustomCLIP(nn.Module):
         return logits, image_features_normalize, image_features
         
     def forward(self, x, classnames):
-        photo_tensor, sk_tensor, photo_aug_tensor, sk_aug_tensor, neg_tensor, label = x
+        photo_tensor, sk_tensor, photo_aug_tensor, sk_aug_tensor, neg_tensor, label, pos_id = x
         pos_logits, photo_features_norm, photo_feature = self.get_logits(photo_tensor, classnames)
         sk_logits, sk_feature_norm, sk_feature = self.get_logits(sk_tensor, classnames, type='sketch')
         _, neg_feature, _ = self.get_logits(neg_tensor, classnames)
@@ -109,7 +109,7 @@ class CustomCLIP(nn.Module):
             sk_aug_features = None
             
         return photo_features_norm, sk_feature_norm, photo_aug_features, sk_aug_features, \
-            neg_feature, label, pos_logits, sk_logits, photo_feature, sk_feature
+            neg_feature, label, pos_logits, sk_logits, photo_feature, sk_feature, pos_id
         
             
     def extract_feature(self, image, classname, type='photo'):

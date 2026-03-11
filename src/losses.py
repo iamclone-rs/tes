@@ -3,6 +3,7 @@ import copy
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from src.utils import is_fg_dataset
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -55,11 +56,47 @@ def cross_loss(feature_1, feature_2, args):
     return nn.CrossEntropyLoss()(logits, labels)
 
 
+def _mine_hard_negative(args, anchor_features, positive_features, fallback_negative_features, label, pos_id):
+    similarity = anchor_features @ positive_features.t()
+    batch_size = similarity.size(0)
+    feat_device = similarity.device
+
+    label = label.to(device=feat_device, dtype=torch.long)
+    pos_id = pos_id.to(device=feat_device, dtype=torch.long)
+    eye_mask = torch.eye(batch_size, dtype=torch.bool, device=feat_device)
+
+    if is_fg_dataset(args):
+        candidate_mask = label.view(-1, 1).eq(label.view(1, -1))
+        candidate_mask = candidate_mask & pos_id.view(-1, 1).ne(pos_id.view(1, -1))
+    else:
+        candidate_mask = label.view(-1, 1).ne(label.view(1, -1))
+
+    candidate_mask = candidate_mask & ~eye_mask
+    has_candidate = candidate_mask.any(dim=1)
+    masked_similarity = similarity.masked_fill(~candidate_mask, float("-inf"))
+    hard_indices = masked_similarity.argmax(dim=1)
+    hard_negative_features = positive_features[hard_indices]
+
+    hard_similarity = (anchor_features * hard_negative_features).sum(dim=1)
+    fallback_similarity = (anchor_features * fallback_negative_features).sum(dim=1)
+    use_hard_negative = has_candidate & (hard_similarity > fallback_similarity)
+
+    return torch.where(
+        use_hard_negative.view(-1, 1),
+        hard_negative_features,
+        fallback_negative_features,
+    )
+
+
 def loss_fn(args, model, features, mode='train'):
     photo_features_norm, sk_feature_norm, photo_aug_features, sk_aug_features, \
-        neg_features, label, pos_logits, sk_logits, photo_features, sk_features = features
+        neg_features, label, pos_logits, sk_logits, photo_features, sk_features, pos_id = features
 
     label = label.to(pos_logits.device)
+    if torch.is_tensor(pos_id):
+        pos_id = pos_id.to(pos_logits.device)
+    else:
+        pos_id = torch.full_like(label, -1)
     loss_mcc = mcc_loss(photo_features, sk_features)
     
     loss_ce_photo = F.cross_entropy(pos_logits, label)
@@ -75,8 +112,16 @@ def loss_fn(args, model, features, mode='train'):
     
     distance_fn = lambda x, y: 1.0 - F.cosine_similarity(x, y)
     triplet = nn.TripletMarginWithDistanceLoss(
-            distance_function=distance_fn, margin=0.3)
-    loss_triplet = triplet(sk_feature_norm, photo_features_norm, neg_features)
+            distance_function=distance_fn, margin=getattr(args, "triplet_margin", 0.3))
+    hard_neg_features = _mine_hard_negative(
+        args=args,
+        anchor_features=sk_feature_norm.float(),
+        positive_features=photo_features_norm.float(),
+        fallback_negative_features=neg_features.float(),
+        label=label,
+        pos_id=pos_id,
+    )
+    loss_triplet = triplet(sk_feature_norm.float(), photo_features_norm.float(), hard_neg_features)
     
     loss_photo_skt = cross_loss(photo_features, sk_features, args)
 

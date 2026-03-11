@@ -15,7 +15,71 @@ if PROJECT_ROOT not in sys.path:
 
 from src.sketchy_dataset import TrainDataset, ValidDataset
 from src.model import ZS_SBIR
-from src.utils import get_all_categories
+from src.utils import get_all_categories, is_fg_dataset
+
+
+class PKBatchSampler(torch.utils.data.Sampler):
+    def __init__(
+        self,
+        dataset,
+        *,
+        batch_size,
+        samples_per_class,
+        seed=42,
+        drop_last=True,
+    ):
+        if samples_per_class <= 0:
+            raise ValueError("samples_per_class must be > 0")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+        if batch_size % samples_per_class != 0:
+            raise ValueError("batch_size must be divisible by samples_per_class")
+
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.samples_per_class = samples_per_class
+        self.classes_per_batch = batch_size // samples_per_class
+        self.seed = seed
+        self.drop_last = drop_last
+        self._epoch = 0
+
+        label_to_indices = {}
+        for idx, sketch_path in enumerate(self.dataset.all_sketches_path):
+            category = sketch_path.split(os.path.sep)[-2]
+            label = self.dataset.category_to_idx.get(category)
+            if label is None:
+                continue
+            label_to_indices.setdefault(label, []).append(idx)
+
+        self.label_to_indices = {
+            label: indices for label, indices in label_to_indices.items() if indices
+        }
+        self.labels = list(self.label_to_indices.keys())
+        if not self.labels:
+            raise ValueError("No labels found for PK sampling")
+
+    def __len__(self):
+        if self.drop_last:
+            return len(self.dataset) // self.batch_size
+        return (len(self.dataset) + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        rng = np.random.RandomState(self.seed + self._epoch)
+        self._epoch += 1
+
+        for _ in range(len(self)):
+            chosen_labels = rng.choice(
+                self.labels,
+                size=self.classes_per_batch,
+                replace=len(self.labels) < self.classes_per_batch,
+            )
+            batch_indices = []
+            for label in chosen_labels:
+                pool = self.label_to_indices[label]
+                replace = len(pool) < self.samples_per_class
+                selected = rng.choice(pool, size=self.samples_per_class, replace=replace)
+                batch_indices.extend(int(index) for index in selected.tolist())
+            yield batch_indices
 
 def get_datasets(opts, subset_ratio=0.2):
     seed = 42
@@ -41,8 +105,21 @@ def get_datasets(opts, subset_ratio=0.2):
         val_indices = random.sample(range(len(val_photo)), val_size)
         val_photo = Subset(val_photo, val_indices)
 
-
-    train_loader = DataLoader(dataset=train_dataset, batch_size=opts.batch_size, num_workers=opts.workers, shuffle=True)
+    use_pk_sampling = (
+        bool(getattr(opts, "pk_sampling", True))
+        and is_fg_dataset(opts)
+        and not isinstance(train_dataset, Subset)
+    )
+    if use_pk_sampling:
+        batch_sampler = PKBatchSampler(
+            train_dataset,
+            batch_size=opts.batch_size,
+            samples_per_class=opts.samples_per_class,
+            seed=opts.sampler_seed,
+        )
+        train_loader = DataLoader(dataset=train_dataset, batch_sampler=batch_sampler, num_workers=opts.workers)
+    else:
+        train_loader = DataLoader(dataset=train_dataset, batch_size=opts.batch_size, num_workers=opts.workers, shuffle=True)
     val_sketch_loader = DataLoader(dataset=val_sketch, batch_size=opts.test_batch_size, num_workers=opts.workers, shuffle=False)
     val_photo_loader = DataLoader(dataset=val_photo, batch_size=opts.test_batch_size, num_workers=opts.workers, shuffle=False)
 
@@ -68,6 +145,7 @@ if __name__ == "__main__":
     parser.add_argument("--w_distill", type=float, default=1.0, help="weight for distillation loss")
     parser.add_argument("--w_cls", type=float, default=1.0, help="weight for classification loss")
     parser.add_argument("--w_mcc", type=float, default=1.0, help="weight for MCC loss")
+    parser.add_argument("--triplet_margin", type=float, default=0.3, help="margin used for triplet loss")
     
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument('--batch_size', type=int, default=32)
@@ -81,6 +159,9 @@ if __name__ == "__main__":
     parser.add_argument('--use_co_ph', type=bool, default=True)
     parser.add_argument('--progress', type=bool, default=False, help=argparse.SUPPRESS)
     parser.add_argument('--use_subset', type=bool, default=False)
+    parser.add_argument('--pk_sampling', type=bool, default=True, help='use PK sampler for FG hard triplet training')
+    parser.add_argument('--samples_per_class', type=int, default=4, help='number of samples per class in one PK batch')
+    parser.add_argument('--sampler_seed', type=int, default=42, help='seed for PK sampler')
     
     parser.add_argument('--exp_name', type=str, default='Co_prompt')
     

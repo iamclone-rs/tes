@@ -93,12 +93,17 @@ class TrainDataset(torch.utils.data.Dataset):
         self.all_photos_path = {}
         self.fg_pos_photo = {}
         self.all_photo_paths = []
+        self.photo_id_map = {}
 
         for category in self.all_categories:
             sketch_paths = sorted(glob.glob(os.path.join(self.opts.root, 'sketch', category, '*')))
             photo_paths = sorted(glob.glob(os.path.join(self.opts.root, 'photo', category, '*')))
             self.all_photos_path[category] = photo_paths
             self.all_photo_paths.extend(photo_paths)
+            for photo_path in photo_paths:
+                normalized_path = os.path.normcase(os.path.normpath(photo_path))
+                if normalized_path not in self.photo_id_map:
+                    self.photo_id_map[normalized_path] = len(self.photo_id_map)
 
             if self.is_fg:
                 photo_by_instance = {_photo_instance_id(path): path for path in photo_paths}
@@ -145,8 +150,19 @@ class TrainDataset(torch.utils.data.Dataset):
         
         sk_aug_tensor = self.transform2(sk_data)
         img_aug_tensor = self.transform2(img_data)
-        
-        return img_tensor, sk_tensor, img_aug_tensor, sk_aug_tensor, neg_tensor, self.category_to_idx[category]
+
+        normalized_img_path = os.path.normcase(os.path.normpath(img_path))
+        pos_id = self.photo_id_map.get(normalized_img_path, -1)
+
+        return (
+            img_tensor,
+            sk_tensor,
+            img_aug_tensor,
+            sk_aug_tensor,
+            neg_tensor,
+            self.category_to_idx[category],
+            pos_id,
+        )
 
 
 class ValidDataset(torch.utils.data.Dataset):
