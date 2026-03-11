@@ -17,6 +17,45 @@ def freeze_all_but_bn(m):
             m.weight.requires_grad_(False)
         if hasattr(m, 'bias') and m.bias is not None:
             m.bias.requires_grad_(False)
+
+
+class JigsawSolver(nn.Module):
+    def __init__(
+        self,
+        *,
+        embed_dim,
+        num_classes,
+        num_layers=2,
+        nhead=8,
+        dropout=0.1,
+    ):
+        super().__init__()
+        if embed_dim % nhead != 0:
+            raise ValueError("embed_dim must be divisible by nhead")
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=nhead,
+            dim_feedforward=embed_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.pos_embed = nn.Parameter(torch.zeros(1, 2, embed_dim))
+        self.classifier = nn.Linear(embed_dim, num_classes)
+
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.classifier.weight, std=0.02)
+        nn.init.zeros_(self.classifier.bias)
+
+    def forward(self, tokens):
+        if tokens.dim() != 3 or tokens.size(1) != 2:
+            raise ValueError("Expected tokens with shape [B, 2, D]")
+        encoded = self.encoder(tokens + self.pos_embed.to(dtype=tokens.dtype, device=tokens.device))
+        pooled = encoded.mean(dim=1)
+        return self.classifier(pooled)
             
 class CustomCLIP(nn.Module):
     def __init__(
@@ -40,6 +79,15 @@ class CustomCLIP(nn.Module):
         self.model_distill = clip_model_distill
         self.image_adapter_m = 0.1
         self.text_adapter_m = 0.1
+        self.use_cjs = bool(getattr(cfg, "use_cjs", True))
+        if self.use_cjs:
+            self.jigsaw_solver = JigsawSolver(
+                embed_dim=512,
+                num_classes=int(getattr(cfg, "jigsaw_num_perm", 100)),
+                num_layers=int(getattr(cfg, "jigsaw_layers", 2)),
+                nhead=int(getattr(cfg, "jigsaw_nhead", 8)),
+                dropout=float(getattr(cfg, "jigsaw_dropout", 0.1)),
+            )
     
     def get_logits(self, img_tensor, classnames, type='photo'):
         if type=='photo':
@@ -93,10 +141,17 @@ class CustomCLIP(nn.Module):
         return logits, image_features_normalize, image_features
         
     def forward(self, x, classnames):
-        photo_tensor, sk_tensor, photo_aug_tensor, sk_aug_tensor, neg_tensor, label, pos_id = x
+        if self.use_cjs:
+            photo_tensor, sk_tensor, photo_aug_tensor, sk_aug_tensor, neg_tensor, \
+                sk_perm_tensor, perm_idx, label, pos_id = x
+        else:
+            photo_tensor, sk_tensor, photo_aug_tensor, sk_aug_tensor, neg_tensor, label, pos_id = x
+            sk_perm_tensor = None
+            perm_idx = None
+
         pos_logits, photo_features_norm, photo_feature = self.get_logits(photo_tensor, classnames)
         sk_logits, sk_feature_norm, sk_feature = self.get_logits(sk_tensor, classnames, type='sketch')
-        _, neg_feature, _ = self.get_logits(neg_tensor, classnames)
+        _, neg_feature_norm, _ = self.get_logits(neg_tensor, classnames)
         
         if self.cfg.use_co_ph:
             photo_aug_features = self.model_distill.encode_image(photo_aug_tensor)
@@ -107,9 +162,19 @@ class CustomCLIP(nn.Module):
             sk_aug_features = self.model_distill.encode_image(sk_aug_tensor)
         else:
             sk_aug_features = None
-            
+
+        jig_logits_r, jig_logits_pos, jig_logits_neg = None, None, None
+        if self.use_cjs:
+            _, sk_perm_feature_norm, _ = self.get_logits(sk_perm_tensor, classnames, type='sketch')
+            r = torch.stack([sk_feature_norm, sk_perm_feature_norm], dim=1)
+            r_pos = torch.stack([photo_features_norm, sk_perm_feature_norm], dim=1)
+            r_neg = torch.stack([neg_feature_norm, sk_perm_feature_norm], dim=1)
+            jigsaw_logits = self.jigsaw_solver(torch.cat([r, r_pos, r_neg], dim=0).float())
+            jig_logits_r, jig_logits_pos, jig_logits_neg = jigsaw_logits.chunk(3, dim=0)
+
         return photo_features_norm, sk_feature_norm, photo_aug_features, sk_aug_features, \
-            neg_feature, label, pos_logits, sk_logits, photo_feature, sk_feature, pos_id
+            neg_feature_norm, label, pos_logits, sk_logits, photo_feature, sk_feature, pos_id, \
+            jig_logits_r, jig_logits_pos, jig_logits_neg, perm_idx
         
             
     def extract_feature(self, image, classname, type='photo'):

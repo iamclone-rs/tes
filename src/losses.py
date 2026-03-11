@@ -13,6 +13,7 @@ def _loss_weight(args, name, default=1.0):
   
 def mcc_loss(sk_feature, photo_feature):
     l1 = nn.L1Loss()
+    feat_device = sk_feature.device
     sk_feature = F.normalize(sk_feature)
     photo_feature = F.normalize(photo_feature)
     
@@ -22,15 +23,16 @@ def mcc_loss(sk_feature, photo_feature):
     mcc_sk = torch.tensor(0.1)
     mcc_ph = torch.tensor(0)
     
-    loss_mcc_sk = l1(sk2sk_sim.mean(), mcc_sk.to(device)) * 4
-    loss_mcc_ph = l1(ph2ph_sim.mean(),mcc_ph.to(device)) * 8
+    loss_mcc_sk = l1(sk2sk_sim.mean(), mcc_sk.to(feat_device)) * 4
+    loss_mcc_ph = l1(ph2ph_sim.mean(),mcc_ph.to(feat_device)) * 8
     
     return loss_mcc_sk + loss_mcc_ph
 
 def cross_loss(feature_1, feature_2, args):
+    feat_device = feature_1.device
     labels = torch.cat([torch.arange(len(feature_1)) for _ in range(2)], dim=0)
     labels = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
-    labels = labels.to(device)
+    labels = labels.to(feat_device)
 
     feature_1 = F.normalize(feature_1, dim=1)
     feature_2 = F.normalize(feature_2, dim=1)
@@ -39,7 +41,7 @@ def cross_loss(feature_1, feature_2, args):
     similarity_matrix = torch.matmul(features, features.T)  # (2*B, 2*B)
 
     # discard the main diagonal from both: labels and similarities matrix
-    mask = torch.eye(labels.shape[0], dtype=torch.bool).to(device)
+    mask = torch.eye(labels.shape[0], dtype=torch.bool, device=feat_device)
     labels = labels[~mask].view(labels.shape[0], -1)
     similarity_matrix = similarity_matrix[~mask].view(similarity_matrix.shape[0], -1)  # (2*B, 2*B - 1)
 
@@ -49,7 +51,7 @@ def cross_loss(feature_1, feature_2, args):
     negatives = similarity_matrix[~labels.bool()].view(similarity_matrix.shape[0], -1)  # (2*B, 2*(B - 1))
 
     logits = torch.cat([positives, negatives], dim=1)
-    labels = torch.zeros(logits.shape[0], dtype=torch.long).to(device)
+    labels = torch.zeros(logits.shape[0], dtype=torch.long, device=feat_device)
 
     logits = logits / args.temperature
 
@@ -88,9 +90,18 @@ def _mine_hard_negative(args, anchor_features, positive_features, fallback_negat
     )
 
 
+def conditional_cross_modal_jigsaw_loss(jig_logits_r, jig_logits_pos, jig_logits_neg, perm_idx):
+    perm_idx = perm_idx.to(device=jig_logits_r.device, dtype=torch.long)
+    loss_r = F.cross_entropy(jig_logits_r, perm_idx)
+    loss_pos = F.cross_entropy(jig_logits_pos, perm_idx, reduction="none")
+    loss_neg = F.cross_entropy(jig_logits_neg, perm_idx, reduction="none")
+    return loss_r + F.relu(loss_pos - loss_neg).mean()
+
+
 def loss_fn(args, model, features, mode='train'):
     photo_features_norm, sk_feature_norm, photo_aug_features, sk_aug_features, \
-        neg_features, label, pos_logits, sk_logits, photo_features, sk_features, pos_id = features
+        neg_features, label, pos_logits, sk_logits, photo_features, sk_features, pos_id, \
+        jig_logits_r, jig_logits_pos, jig_logits_neg, perm_idx = features
 
     label = label.to(pos_logits.device)
     if torch.is_tensor(pos_id):
@@ -124,6 +135,14 @@ def loss_fn(args, model, features, mode='train'):
     loss_triplet = triplet(sk_feature_norm.float(), photo_features_norm.float(), hard_neg_features)
     
     loss_photo_skt = cross_loss(photo_features, sk_features, args)
+    loss_cjs = torch.tensor(0.0, device=pos_logits.device)
+    if bool(getattr(args, "use_cjs", True)) and jig_logits_r is not None:
+        loss_cjs = conditional_cross_modal_jigsaw_loss(
+            jig_logits_r=jig_logits_r,
+            jig_logits_pos=jig_logits_pos,
+            jig_logits_neg=jig_logits_neg,
+            perm_idx=perm_idx,
+        )
 
     return (
         _loss_weight(args, "w_triplet") * loss_triplet
@@ -131,4 +150,5 @@ def loss_fn(args, model, features, mode='train'):
         + _loss_weight(args, "w_distill") * loss_distill
         + _loss_weight(args, "w_cls") * loss_cls
         + _loss_weight(args, "w_mcc") * loss_mcc
+        + _loss_weight(args, "w_cjs", 0.1) * loss_cjs
     )
